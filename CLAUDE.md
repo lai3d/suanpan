@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-suanpan is an INT8 neural-network inference accelerator written in SystemVerilog, developed in stages. The repo is at stage 1: RTL verified in simulation against a bit-exact integer model, plus pre-layout synthesis estimates. There is no FPGA or tapeout flow yet.
+suanpan is an INT8 neural-network inference accelerator written in SystemVerilog, developed in three stages (see `docs/three-stages.md`; a Chinese translation sits next to it and the two must be kept in sync). Stage 1 is done: RTL verified in simulation against a bit-exact integer model, plus pre-layout synthesis estimates. Stage 2 is in progress: a Tang Nano 20K demo builds to a bitstream and passes gate-level simulation, but has not been run on a board. There is no tapeout flow.
 
 ## Commands
 
@@ -17,7 +17,13 @@ make sim-full   # all 10,000 test images under Verilator
 make wave       # one image, dumps build/tb.vcd
 make lint       # verilator --lint-only -Wall on the RTL
 make synth      # Yosys + ABC onto SKY130, PERIOD=<ps>
+
+make fpga-sim      # Tang Nano 20K wrapper in RTL simulation
+make fpga          # synth_gowin + nextpnr-himbaechel + gowin_pack -> build/fpga/top.fs
+make fpga-gatesim  # simulate the placed-and-routed netlist
 ```
+
+The `fpga` targets need the OSS CAD Suite on `PATH` (Homebrew has no `nextpnr-himbaechel`). Vendor tools are not an option on macOS.
 
 - `ARCH=cnn` (default), `ARCH=mlp` or `ARCH=stress` selects the network for `model`, `sim`, `sim-full` and `wave`. Each has its own `build/<arch>/` directory.
 - The quickest check after an RTL change is `make sim N=5`. Before finishing, run `make lint` and `make sim-full` for `ARCH=cnn`, `ARCH=mlp` and `ARCH=stress`; CI runs all three. The MLP exercises the fully-connected path as a degenerate convolution. `stress` is not a useful network: it exists to hit hardware corner cases (a hidden layer with one-word windows, which forces the front end to wait for the post unit, and a layer width that is not a multiple of 8). If you add a corner case to the RTL, extend `stress` to reach it.
@@ -57,6 +63,13 @@ Two timing rules hold this together. The post unit is busy for 9 cycles, so `S_N
 - **Icarus is the stricter front end.** It rejects enum assignment through a ternary (`state <= c ? A : B`) and warns on variable part-selects inside `always_comb`; use `if/else` and per-lane loops as the existing code does. Code must build under both Icarus and Verilator.
 - **Layer constraints.** Valid convolutions only (no padding), no pooling, convolution output channels must be a multiple of 8, and one requantization scale per layer. `compile_program()` asserts the channel rule.
 - **Buffer sizes are parameters.** `A_AW`, `W_AW`, `B_AW` in `nn_accel.sv` bound the largest feature map, weight count and bias count. The testbench has its own `A_AW` and `MAX_*` limits that must cover the network being run.
+
+## FPGA flow
+
+- **A failing gate-level simulation is not automatically a design bug.** Yosys' Gowin simulation library declares the block RAM (`SPX9`) and the multipliers as black boxes, so their outputs are X. `fpga/gowin_sim.v` holds behavioural models written from Yosys' own mapping files (`brams_map.v`, `dsp_map.v`), and `fpga/gatesim.sh` swaps them in. If synthesis starts using a cell that has no model there, the symptom is X on the outputs with a correct cycle count.
+- **Partially initialized ROMs look uninitialized in a dump.** Yosys prints `INIT` MSB-first, so a ROM whose upper addresses are unused starts with a long run of `x`. Count defined bits before concluding a `$readmemh` did not load.
+- **The bias table is forced into logic** in `fpga/tangnano20k/build.sh`. As a block RAM it is the only 36-bit-wide `SPX9`, and nextpnr reports 35 hold violations on its address pins for every seed.
+- **Board facts.** Pins are from Sipeed's example repo (clock 4, LEDs 15-20 active low, button 88). The button's polarity is unverified, which is why the wrapper triggers on any debounced change.
 
 ## Reporting numbers
 

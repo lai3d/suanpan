@@ -55,7 +55,10 @@ module nn_accel #(
     parameter int W_AW       = 13,   // weight memory address bits (words)
     parameter int A_AW       = 10,   // activation buffer address bits (words)
     parameter int B_AW       = 7,    // bias memory address bits
-    parameter int MAX_LAYERS = 4
+    parameter int MAX_LAYERS = 4,
+    // optional $readmemh images for the weight and bias memories (ROM use)
+    parameter     W_FILE     = "",
+    parameter     B_FILE     = ""
 ) (
     input  logic                clk,
     input  logic                rst_n,
@@ -146,10 +149,10 @@ module nn_accel #(
     logic [A_AW-1:0] dst_addr;
     logic [P*8-1:0] dst_data;
 
-    sram_sp #(.DW(P*8), .AW(W_AW)) u_wmem (
+    sram_sp #(.DW(P*8), .AW(W_AW), .FILE(W_FILE)) u_wmem (
         .clk, .we(1'b0), .addr(w_ptr), .wdata('0), .rdata(w_q));
 
-    sram_sp #(.DW(32), .AW(B_AW)) u_bmem (
+    sram_sp #(.DW(32), .AW(B_AW), .FILE(B_FILE)) u_bmem (
         .clk, .we(1'b0), .addr(b_ptr), .wdata('0), .rdata(b_q));
 
     logic            bufa_we, bufb_we;
