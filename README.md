@@ -1,5 +1,7 @@
 # suanpan (算盘)
 
+[![CI](https://github.com/lai3d/suanpan/actions/workflows/ci.yml/badge.svg)](https://github.com/lai3d/suanpan/actions/workflows/ci.yml)
+
 An AI chip designed from scratch, one stage at a time. The name is the Chinese
 abacus: like its beads, the core of the chip multiplies and accumulates.
 
