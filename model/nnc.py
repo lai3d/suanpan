@@ -152,6 +152,37 @@ def rewrite_fc_input(input_shape, specs):
     return (1, 1, h * w * c), (h, w) != (1, 1)
 
 
+def apply_overlap(geo):
+    """Overlap packing for a first convolution with few input channels.
+
+    Normally a pixel is one memory word however few channels it has, so a
+    3-channel image wastes 5 of the 8 lanes. Here every input word holds its
+    own pixel *and the next n-1 pixels of the row* (n = 8 // channels), so a
+    kernel row of kw pixels is read as ceil(kw / n) words, n pixels apart,
+    instead of kw words. The input is stored with its zero padding included,
+    which removes the need to mask partially valid words.
+
+    Only the memory layout changes: the same products are summed, so results
+    are bit-identical. Marks geo[0] and returns True if it applies."""
+    g = geo[0]
+    n = P // g["c"]
+    if g["kind"] != "conv" or n < 2 or -(-g["kw"] // n) >= g["kw"]:
+        return False
+    if g["w"] + 2 * g["p"] > 255 or g["h"] + 2 * g["p"] > 255:
+        return False
+    g["ovl"] = n
+    return True
+
+
+def overlap_pack(a, g):
+    """(N,H,W,C) -> (N,H',W',n*C): word x of a row holds pixels x .. x+n-1 of
+    the zero-padded image (zeros past the right edge)."""
+    n, p = g["ovl"], g["p"]
+    a = np.pad(a, ((0, 0), (p, p), (p, p + n - 1), (0, 0)))
+    w = a.shape[2] - (n - 1)
+    return np.concatenate([a[:, :, j:j + w, :] for j in range(n)], 3)
+
+
 def pad_conv_channels(input_shape, specs, fparams):
     """The hardware writes convolution outputs a whole word at a time, so
     their channel count is rounded up to a multiple of 8 with all-zero
@@ -318,7 +349,20 @@ def compile_program(geo, qparams):
                 in_w=g["w"], in_h=g["h"], pad=0, stride=g["s"],
                 out_ch=cw, pool=1, **common))
             continue
-        if g["kind"] == "fc":
+        w = q["w"].reshape(g["oc"], g["kh"], g["kw"], g["c"])
+        if g.get("ovl"):
+            # overlap-packed input: one word per position, n pixels in it;
+            # a kernel row is kwp words read n positions apart
+            n = g["ovl"]
+            wp, hp = g["w"] + 2 * g["p"], g["h"] + 2 * g["p"]
+            kwp = -(-g["kw"] // n)
+            window = dict(kw=kwp, kh=g["kh"], rd_words=1, pix_step=n,
+                          row_step=wp - (kwp - 1) * n, org=0,
+                          in_w=wp, in_h=hp, pad=0, stride=g["s"])
+            common.update(step_x=g["s"], step_y=g["s"] * wp)
+            w = np.pad(w, ((0, 0), (0, 0), (0, kwp * n - g["kw"]), (0, 0)))
+            w = w.reshape(g["oc"], g["kh"], kwp, n * g["c"])
+        elif g["kind"] == "fc":
             # one "pixel" that is the whole input
             window = dict(kw=1, kh=1, rd_words=g["h"] * g["w"] * cw, pix_step=1,
                           row_step=1, org=0, in_w=1, in_h=1, pad=0, stride=1)
@@ -332,7 +376,6 @@ def compile_program(geo, qparams):
                           org=(-(g["p"] * g["w"] + g["p"]) * cw) & 0xFFFF,
                           in_w=g["w"], in_h=g["h"], pad=g["p"], stride=g["s"])
         cfg.append(cfg_word(li, out_ch=g["oc"], pool=0, **window, **common))
-        w = q["w"].reshape(g["oc"], g["kh"], g["kw"], g["c"])
         w_words = pack_words(pad_c(w).reshape(g["oc"], -1))
         weights.append(w_words)
         # per-output parameter word: bias, multiplier M, shift S
@@ -345,6 +388,8 @@ def compile_program(geo, qparams):
 def requirements(geo, weights, params):
     """What the network needs from the hardware."""
     words = [g["h"] * g["w"] * -(-g["c"] // P) for g in geo]
+    if geo[0].get("ovl"):      # stored with its padding, one word per position
+        words[0] = (geo[0]["h"] + 2 * geo[0]["p"]) * (geo[0]["w"] + 2 * geo[0]["p"])
     # layer i reads buffer A if i is even, B if odd, and writes the other one;
     # the last layer's output is the logits and is not stored
     bufa = max(words[0::2])
@@ -412,6 +457,8 @@ def cycles(geo):
         outs = g["oh"] * g["ow"]
         if g["kind"] == "pool":
             total += outs * cw * g["kh"] * g["kw"]
+        elif g.get("ovl"):
+            total += outs * g["oc"] * g["kh"] * -(-g["kw"] // g["ovl"])
         else:
             total += outs * g["oc"] * g["kh"] * g["kw"] * cw
     return total
@@ -419,7 +466,8 @@ def cycles(geo):
 
 def export(out, geo, qparams, test_a, labels=None, limits=LIMITS):
     """Write every file the RTL testbench and the FPGA build read.
-    `test_a` is (N,H,W,C) int 0..127, already in the network's input layout."""
+    `test_a` is (N,H,W,C) int 0..127, already in the network's input layout
+    (overlap packing, if geo[0] is marked for it, is applied here)."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     logits, pred = golden(geo, qparams, test_a)
@@ -427,7 +475,8 @@ def export(out, geo, qparams, test_a, labels=None, limits=LIMITS):
     req = requirements(geo, weights, params)
     check_limits(req, limits)
     n = len(test_a)
-    images = pad_c(test_a).reshape(n, -1)
+    stored = overlap_pack(test_a, geo[0]) if geo[0].get("ovl") else test_a
+    images = pad_c(stored).reshape(n, -1)
     assert images.shape[1] // P == req["in_words"]
     write_hex(out / "weights.hex", weights, 16)
     write_hex(out / "params.hex", params, 14)
