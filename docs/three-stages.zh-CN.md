@@ -21,7 +21,7 @@
 
 这一层回答不了的事：真实的连线延迟、时钟分布、存储器的时序、功耗。这些要等物理实现。
 
-用到的工具：仿真用 Icarus Verilog 和 Verilator，综合用 Yosys，全部开源。这一层的具体成果见 [README](../README.md)。
+用到的工具：仿真用 Icarus Verilog 和 Verilator，综合用 Yosys，全部开源。这一层的具体成果见 [README](../README.zh-CN.md)。
 
 ## 层次 2：FPGA
 

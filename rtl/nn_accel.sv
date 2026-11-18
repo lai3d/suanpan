@@ -7,18 +7,16 @@
 //     hidden layer: y = clamp((acc * M + 2^(S-1)) >>> S, 0, 127)  -> next buffer
 //     last layer  : raw acc streamed out as a logit, argmax tracked
 //
-// Timing: the MAC loop is a 3-stage pipeline (multiply, adder tree,
-// accumulate). Requantisation runs once per output, so it is spread over
-// several cycles with one small 9x17 multiplier (acc is consumed a byte at a
-// time, MSB first) instead of a single wide multiply-shift-clamp path.
+// Timing: everything after address generation is a feed-forward pipeline.
+// The MAC loop has three stages (multiply, adder tree, accumulate). When the
+// last word of an output reaches the accumulator its sum drops into the post
+// pipeline: four 9x17 multiplies (one per byte of acc, times M), recombine in
+// two steps, round, shift, clamp, write back.
 //
-// Throughput: the front end (address generation) and the post unit
-// (requantise + write back) are separate state machines. As soon as the last
-// word of an output has been issued the front end starts the next output,
-// while the finished sum is handed to the post unit. The bias is the initial
-// value of the accumulator, so it costs no cycle. An output therefore takes
-// (words + 1) cycles, with a minimum spacing of POST_GAP cycles so the post
-// unit is always free when the next sum arrives.
+// Throughput: because the post pipeline accepts a new sum every cycle, the
+// front end never waits. It issues the windows of consecutive outputs back to
+// back, so an output costs exactly as many cycles as its window has words.
+// The bias is the initial value of the accumulator and costs nothing.
 //
 // Layers. Activations are stored HWC with the channel count padded to a
 // multiple of P, so a pixel is a whole number of P-byte words and each kernel
@@ -89,19 +87,9 @@ module nn_accel #(
 
     // front end: walks layers, output pixels and kernel windows
     typedef enum logic [2:0] {
-        S_IDLE, S_LOAD, S_LAYER, S_NEURON, S_MAC, S_DRAIN, S_NEXT, S_DONE
+        S_IDLE, S_LOAD, S_LAYER, S_MAC, S_DRAIN, S_NEXT, S_DONE
     } state_t;
     state_t state;
-
-    // post unit: requantises one finished sum and writes it back
-    typedef enum logic [2:0] {
-        P_IDLE, P_MUL, P_MULF, P_RADD, P_SHIFT, P_CLAMP, P_OUT
-    } pstate_t;
-    pstate_t pstate;
-
-    // The post unit is busy for 9 cycles after a hand-off (4x P_MUL, P_MULF,
-    // P_RADD, P_SHIFT, P_CLAMP, P_OUT), so outputs must start >= 10 apart.
-    localparam logic [3:0] POST_GAP = 4'd10;
 
     // ---------------------------------------------------------------- config
     logic [143:0] cfg_mem [0:MAX_LAYERS-1];
@@ -123,7 +111,6 @@ module nn_accel #(
     logic signed [47:0] c_round;   // 2^(shift-1), decoded once per layer
 
     // -------------------------------------------------------------- counters
-    logic [15:0]     oidx;       // output index within the layer (all pixels)
     logic [11:0]     och;        // output channel within the pixel
     logic [7:0]      px, py;     // output pixel
     logic [11:0]     kc;         // word within the kernel row
@@ -172,21 +159,35 @@ module nn_accel #(
 
     // ------------------------------------------------------------- MAC pipe
     //   cycle n   : address issued (state == S_MAC)
-    //   cycle n+1 : memory data valid, P products registered     (v1)
-    //   cycle n+2 : adder tree over the products, registered      (v2)
-    //   cycle n+3 : partial sum added into the accumulator        (v3)
-    // Each word carries two tags down the pipe: f = first word of an output,
-    // l = last word of an output.
+    //   cycle n+1 : memory data valid, registered                 (v0)
+    //   cycle n+2 : P products registered                         (v1)
+    //   cycle n+3 : adder tree over the products, registered      (v2)
+    //   cycle n+4 : partial sum added into the accumulator        (v3)
+    // Stage 0 keeps the memory read (and the buffer select mux) out of the
+    // multiplier path.
+    // Each word carries three tags down the pipe: f = first word of an
+    // output, l = last word of an output, e = last word of the layer.
     logic signed [15+LP:0] dot, dot_r;
-    logic                  v1, v2, v3;
-    logic                  f1, f2, f3;
-    logic                  l1, l2, l3;
+    logic                  v0, v1, v2, v3;
+    logic                  f0, f1, f2, f3;
+    logic                  l0, l1, l2, l3;
+    logic                  e0, e1, e2, e3;
+    logic [P*8-1:0]        w_r, a_r;           // stage-0 operands
     logic signed [31:0]    acc;
-    logic signed [31:0]    bias_r1, bias_r2;   // bias, aligned with f1 / f2
+    logic signed [31:0]    bias_r0, bias_r1, bias_r2;   // bias, aligned with f0..f2
 
     logic mac_first, mac_last;
     assign mac_first = (kc == '0) && (kr == '0);
     assign mac_last  = row_end && (kr == c_nrow_last);
+
+    // window origin of the next output, so its first word can be issued in
+    // the cycle right after this output's last word
+    logic [A_AW-1:0] pix_next;
+    always_comb begin
+        if (!ch_end)       pix_next = pix_base;
+        else if (!col_end) pix_next = pix_base + c_step_x[A_AW-1:0];
+        else               pix_next = row_base + c_step_y[A_AW-1:0];
+    end
 
     // one 32-bit adder: the first word of an output starts from the bias
     logic signed [31:0] acc_y;
@@ -196,44 +197,36 @@ module nn_accel #(
     logic handoff;
     assign handoff = v3 && l3;
 
-    dot_unit #(.P(P)) u_dot (.clk, .en(v1), .w(w_q), .x(a_q), .sum(dot));
+    dot_unit #(.P(P)) u_dot (.clk, .en(v1), .w(w_r), .x(a_r), .sum(dot));
 
-    // minimum spacing between output starts (see POST_GAP)
-    logic [3:0] cool;
-
-    // output index and end-of-layer flag of the output whose last word was
-    // issued most recently; copied into the post unit at hand-off
-    logic [15:0] m_oidx, p_oidx;
-    logic        m_lend, p_lend;
-
-    // ------------------------------------------------------------- requant
-    // prod = pacc * M by Horner's rule over the four bytes of pacc, MSB first:
-    //   prod = ((b3*M * 256 + b2*M) * 256 + b1*M) * 256 + b0*M
-    // pacc doubles as the shift register that feeds the bytes out.
-    logic signed [31:0] pacc;
-    logic signed [8:0]  chunk;   // top byte of pacc; signed only for b3
-    logic signed [25:0] pp;      // chunk * M
-    logic signed [47:0] prod;
-    logic [1:0]         mcnt;
+    // -------------------------------------------------------- post pipeline
+    //   p0 : finished sum                       (also emits last-layer logits)
+    //   p1 : b3*M, b2*M, b1*M, b0*M   where acc = {b3, b2, b1, b0}, b3 signed
+    //   p2 : hi = b3*M << 8 + b2*M,   lo = b1*M << 8 + b0*M
+    //   p3 : acc * M = (hi << 16) + lo
+    //   p4 : + 2^(S-1)
+    //   p5 : >>> S
+    //   p6 : clamp to 0..127, then assembled into a word and written
+    localparam int PN = 7;                   // post pipeline stages
+    logic [PN-1:0]      pv;                  // stage valid
+    logic [PN-1:0]      pe;                  // end-of-layer tag
+    logic signed [31:0] p0_acc;
+    logic signed [25:0] p1_pp [0:3];         // byte * M
+    logic signed [34:0] p2_hi, p2_lo;
+    logic signed [47:0] p3_prod, p4_rnd, p5_shf;
     logic [7:0]         q;
-    assign chunk = {(mcnt == 2'd0) & pacc[31], pacc[31:24]};
-
-    // one shared 48-bit adder: Horner step (prod*256 + pp) or rounding add
-    logic signed [47:0] add_a, add_b, add_y;
-    assign add_a = (pstate == P_RADD) ? prod    : (prod <<< 8);
-    assign add_b = (pstate == P_RADD) ? c_round : 48'(pp);
-    assign add_y = add_a + add_b;
+    logic [15:0]        o_cnt;               // outputs written in this layer
 
     // output word assembly: collect P bytes, then one full-word write
     logic [P*8-1:0] out_word, out_word_n;
     logic           word_full;
     always_comb begin
         for (int k = 0; k < P; k++)
-            out_word_n[k*8 +: 8] = (p_oidx[LP-1:0] == LP'(k)) ? q : out_word[k*8 +: 8];
+            out_word_n[k*8 +: 8] = (o_cnt[LP-1:0] == LP'(k)) ? q : out_word[k*8 +: 8];
     end
-    assign word_full = (p_oidx[LP-1:0] == LP'(P-1)) || p_lend;
-    assign dst_we    = (pstate == P_OUT) && !c_last && word_full;
-    assign dst_addr  = p_oidx[LP +: A_AW];
+    assign word_full = (o_cnt[LP-1:0] == LP'(P-1)) || pe[PN-1];
+    assign dst_we    = pv[PN-1] && word_full;
+    assign dst_addr  = o_cnt[LP +: A_AW];
     assign dst_data  = out_word_n;
 
     logic signed [31:0] best;
@@ -241,9 +234,7 @@ module nn_accel #(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state       <= S_IDLE;
-            pstate      <= P_IDLE;
             layer       <= '0;
-            oidx        <= '0;
             och         <= '0;
             px          <= '0;
             py          <= '0;
@@ -268,6 +259,13 @@ module nn_accel #(
             c_shift     <= '0;
             c_last      <= 1'b0;
             c_round     <= '0;
+            v0          <= 1'b0;
+            f0          <= 1'b0;
+            l0          <= 1'b0;
+            e0          <= 1'b0;
+            w_r         <= '0;
+            a_r         <= '0;
+            bias_r0     <= '0;
             v1          <= 1'b0;
             v2          <= 1'b0;
             v3          <= 1'b0;
@@ -277,20 +275,24 @@ module nn_accel #(
             l1          <= 1'b0;
             l2          <= 1'b0;
             l3          <= 1'b0;
+            e1          <= 1'b0;
+            e2          <= 1'b0;
+            e3          <= 1'b0;
             dot_r       <= '0;
             acc         <= '0;
             bias_r1     <= '0;
             bias_r2     <= '0;
-            cool        <= '0;
-            m_oidx      <= '0;
-            m_lend      <= 1'b0;
-            p_oidx      <= '0;
-            p_lend      <= 1'b0;
-            pacc        <= '0;
-            pp          <= '0;
-            prod        <= '0;
-            mcnt        <= '0;
+            pv          <= '0;
+            pe          <= '0;
+            p0_acc      <= '0;
+            for (int i = 0; i < 4; i++) p1_pp[i] <= '0;
+            p2_hi       <= '0;
+            p2_lo       <= '0;
+            p3_prod     <= '0;
+            p4_rnd      <= '0;
+            p5_shf      <= '0;
             q           <= '0;
+            o_cnt       <= '0;
             out_word    <= '0;
             best        <= '0;
             busy        <= 1'b0;
@@ -304,17 +306,60 @@ module nn_accel #(
             logit_valid <= 1'b0;
 
             // ------------------------------------------------ MAC pipeline
-            v1 <= (state == S_MAC);
-            f1 <= (state == S_MAC) && mac_first;
-            l1 <= (state == S_MAC) && mac_last;
-            v2 <= v1;  f2 <= f1;  l2 <= l1;
-            v3 <= v2;  f3 <= f2;  l3 <= l2;
-            if (v1 && f1) bias_r1 <= $signed(b_q);
+            v0 <= (state == S_MAC);
+            f0 <= (state == S_MAC) && mac_first;
+            l0 <= (state == S_MAC) && mac_last;
+            e0 <= (state == S_MAC) && mac_last && layer_end;
+            v1 <= v0;  f1 <= f0;  l1 <= l0;  e1 <= e0;
+            v2 <= v1;  f2 <= f1;  l2 <= l1;  e2 <= e1;
+            v3 <= v2;  f3 <= f2;  l3 <= l2;  e3 <= e2;
+            if (v0) begin
+                w_r <= w_q;
+                a_r <= a_q;
+            end
+            // b_q holds this output's bias only in the cycle its first word
+            // is at stage 0 (windows can be a single word long)
+            if (v0 && f0) bias_r0 <= $signed(b_q);
+            if (v1 && f1) bias_r1 <= bias_r0;
             if (v2 && f2) bias_r2 <= bias_r1;
             if (v2) dot_r <= dot;
             if (v3) acc   <= acc_y;
 
-            if (cool != '0) cool <= cool - 4'd1;
+            // ----------------------------------------------- post pipeline
+            pv <= {pv[PN-2:1], pv[0] & ~c_last, handoff};
+            pe <= {pe[PN-2:0], e3};
+            if (handoff) p0_acc <= acc_y;
+            if (pv[0]) begin
+                p1_pp[3] <= $signed({p0_acc[31], p0_acc[31:24]}) * $signed({1'b0, c_mult});
+                p1_pp[2] <= $signed({1'b0, p0_acc[23:16]}) * $signed({1'b0, c_mult});
+                p1_pp[1] <= $signed({1'b0, p0_acc[15:8]})  * $signed({1'b0, c_mult});
+                p1_pp[0] <= $signed({1'b0, p0_acc[7:0]})   * $signed({1'b0, c_mult});
+            end
+            if (pv[1]) begin
+                p2_hi <= (35'(p1_pp[3]) <<< 8) + 35'(p1_pp[2]);
+                p2_lo <= (35'(p1_pp[1]) <<< 8) + 35'(p1_pp[0]);
+            end
+            if (pv[2]) p3_prod <= (48'(p2_hi) <<< 16) + 48'(p2_lo);
+            if (pv[3]) p4_rnd  <= p3_prod + c_round;
+            if (pv[4]) p5_shf  <= p4_rnd >>> c_shift;
+            // negative -> 0; any bit above bit 6 set -> saturate at 127
+            if (pv[5]) q <= p5_shf[47] ? 8'd0 : (|p5_shf[46:7]) ? 8'd127 : p5_shf[7:0];
+            if (pv[PN-1]) begin
+                out_word <= word_full ? '0 : out_word_n;
+                o_cnt    <= o_cnt + 16'd1;
+            end
+
+            // last layer: the sum itself is the result
+            if (pv[0] && c_last) begin
+                logit_valid <= 1'b1;
+                logit_idx   <= o_cnt[7:0];
+                logit_data  <= p0_acc;
+                o_cnt       <= o_cnt + 16'd1;
+                if (o_cnt == '0 || p0_acc > best) begin
+                    best      <= p0_acc;
+                    class_idx <= o_cnt[7:0];
+                end
+            end
 
             // --------------------------------------------------- front end
             case (state)
@@ -344,29 +389,24 @@ module nn_accel #(
                 S_LAYER: begin
                     w_ptr    <= c_w_base[W_AW-1:0];
                     b_ptr    <= c_b_base[B_AW-1:0];
-                    oidx     <= '0;
                     och      <= '0;
                     px       <= '0;
                     py       <= '0;
+                    kc       <= '0;
+                    kr       <= '0;
+                    a_ptr    <= '0;
                     pix_base <= '0;
                     row_base <= '0;
+                    o_cnt    <= '0;
                     out_word <= '0;
                     c_round  <= 48'sd1 <<< (c_shift - 6'd1);
-                    state    <= S_NEURON;
-                end
-
-                // one set-up cycle per output; waits only if the previous
-                // output started fewer than POST_GAP cycles ago
-                S_NEURON: if (cool == '0) begin
-                    a_ptr <= pix_base;
-                    kc    <= '0;
-                    kr    <= '0;
-                    cool  <= POST_GAP - 4'd1;
-                    state <= S_MAC;
+                    state    <= S_MAC;
                 end
 
                 // Walk the window: row_len words, skip to the next image row,
                 // repeat for n_rows rows. Weights are read strictly in order.
+                // On the last word, every counter moves on to the next output
+                // so that its first word follows in the very next cycle.
                 S_MAC: begin
                     w_ptr <= w_ptr + 1'b1;
                     if (row_end) begin
@@ -379,11 +419,10 @@ module nn_accel #(
                     end
 
                     if (mac_last) begin
-                        // this output is fully issued: remember where it goes
-                        // and move every counter on to the next output
-                        m_oidx <= oidx;
-                        m_lend <= layer_end;
-                        oidx   <= oidx + 16'd1;
+                        kc       <= '0;
+                        kr       <= '0;
+                        a_ptr    <= pix_next;
+                        pix_base <= pix_next;
                         if (!ch_end) begin
                             // next output channel of the same pixel
                             och   <= och + 12'd1;
@@ -394,23 +433,20 @@ module nn_accel #(
                             w_ptr <= c_w_base[W_AW-1:0];
                             b_ptr <= c_b_base[B_AW-1:0];
                             if (!col_end) begin
-                                px       <= px + 8'd1;
-                                pix_base <= pix_base + c_step_x[A_AW-1:0];
+                                px <= px + 8'd1;
                             end else begin
                                 px       <= '0;
                                 py       <= py + 8'd1;
-                                pix_base <= row_base + c_step_y[A_AW-1:0];
-                                row_base <= row_base + c_step_y[A_AW-1:0];
+                                row_base <= pix_next;
                             end
                         end
                         if (layer_end) state <= S_DRAIN;
-                        else           state <= S_NEURON;
                     end
                 end
 
                 // end of layer: the next layer reads the buffer this one is
                 // still writing, so let everything in flight finish first
-                S_DRAIN: if (!v1 && !v2 && !v3 && pstate == P_IDLE) state <= S_NEXT;
+                S_DRAIN: if (!v0 && !v1 && !v2 && !v3 && pv == '0) state <= S_NEXT;
 
                 S_NEXT: begin
                     if (c_last || layer == num_layers - 3'd1) begin
@@ -429,64 +465,6 @@ module nn_accel #(
 
                 default: state <= S_IDLE;
             endcase
-
-            // --------------------------------------------------- post unit
-            case (pstate)
-                P_MUL: begin
-                    pp   <= chunk * $signed({1'b0, c_mult});
-                    pacc <= {pacc[23:0], 8'h00};
-                    prod <= (mcnt == 2'd0) ? '0 : add_y;
-                    mcnt <= mcnt + 2'd1;
-                    if (mcnt == 2'd3) pstate <= P_MULF;
-                end
-
-                P_MULF: begin
-                    prod   <= add_y;
-                    pstate <= P_RADD;
-                end
-
-                P_RADD: begin
-                    prod   <= add_y;
-                    pstate <= P_SHIFT;
-                end
-
-                P_SHIFT: begin
-                    prod   <= prod >>> c_shift;
-                    pstate <= P_CLAMP;
-                end
-
-                P_CLAMP: begin
-                    // negative -> 0; any bit above bit 6 set -> saturate at 127
-                    q      <= prod[47] ? 8'd0 : (|prod[46:7]) ? 8'd127 : prod[7:0];
-                    pstate <= P_OUT;
-                end
-
-                P_OUT: begin
-                    if (c_last) begin
-                        logit_valid <= 1'b1;
-                        logit_idx   <= p_oidx[7:0];
-                        logit_data  <= pacc;
-                        if (p_oidx == '0 || pacc > best) begin
-                            best      <= pacc;
-                            class_idx <= p_oidx[7:0];
-                        end
-                    end else begin
-                        out_word <= word_full ? '0 : out_word_n;
-                    end
-                    pstate <= P_IDLE;
-                end
-
-                default: ;
-            endcase
-
-            if (handoff) begin
-                pacc   <= acc_y;
-                p_oidx <= m_oidx;
-                p_lend <= m_lend;
-                mcnt   <= '0;
-                if (c_last) pstate <= P_OUT;
-                else        pstate <= P_MUL;
-            end
         end
     end
 endmodule

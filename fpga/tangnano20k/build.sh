@@ -9,15 +9,20 @@ DEVICE=GW2AR-LV18QN88C8/I7
 FAMILY=GW2A-18C
 mkdir -p $OUT
 
-# The bias table is forced into logic. As a block RAM it becomes the design's
-# only 36-bit-wide SPX9, and nextpnr then reports hold violations on its
-# address pins for every placement. It is 34 words, so logic costs nothing.
+# Block RAMs are limited to 18-bit data. Yosys would otherwise use the 36-bit
+# single-port mode for small wide memories, and nextpnr reports hold violations
+# on the extra address pins (ADB*) of every such block, for every placement.
+# The stock memory library is copied with width 36 removed, and the memory
+# mapping step of synth_gowin is run by hand with that copy.
+sed 's/widths 1 2 4 9 18 36 per_port;/widths 1 2 4 9 18 per_port;/' \
+    "$(yosys-config --datdir)/gowin/brams.txt" > $OUT/brams_no36.txt
+
 yosys -q -l $OUT/synth.log -p "
     read_verilog -sv rtl/sram_sp.sv rtl/dot_unit.sv rtl/nn_accel.sv fpga/tangnano20k/top.sv
-    hierarchy -top top
-    flatten
-    setattr -set ram_style \"logic\" m:u_accel.u_bmem.mem
-    synth_gowin -top top -json $OUT/top.json
+    synth_gowin -top top -run :map_ram
+    memory_libmap -lib +/gowin/lutrams.txt -lib $OUT/brams_no36.txt
+    techmap -map +/gowin/lutrams_map.v -map +/gowin/brams_map.v
+    synth_gowin -top top -run map_ffram: -json $OUT/top.json
     write_verilog -noattr $OUT/top_synth.v
 "
 

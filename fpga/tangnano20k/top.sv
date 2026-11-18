@@ -3,8 +3,9 @@
 //
 // After power-on (or any press/release of button S1) the wrapper
 //   1. writes the layer table into the accelerator,
-//   2. copies the 28x28 demo image from ROM into activation buffer A
-//      (one pixel per word: channel 0 = pixel, channels 1..7 = 0),
+//   2. copies the demo image from ROM into activation buffer A. The ROM
+//      already holds it as input words in the network's own layout
+//      (space-to-depth, 14x14 pixels of 4 channels, one word each),
 //   3. starts inference and waits for `done`.
 //
 // LEDs are active low:
@@ -20,7 +21,8 @@ module top #(
     parameter     CFG_FILE  = "build/cnn/cfg.hex",
     parameter     IMG_FILE  = "build/cnn/demo_image.hex",
     parameter int N_LAYERS  = 3,
-    parameter int IN_WORDS  = 784,
+    parameter int IN_WORDS  = 196,
+    parameter int A_AW      = 8,      // activation buffers: 2^A_AW words
     parameter int POR_BITS  = 16      // power-on reset length (2^POR_BITS cycles)
 ) (
     input  logic       clk,           // 27 MHz
@@ -61,7 +63,7 @@ module top #(
 
     // ------------------------------------------------------------ ROMs
     logic [143:0] cfg_rom [0:3];
-    logic [7:0]   img_rom [0:1023];
+    logic [63:0]  img_rom [0:(1<<A_AW)-1];
     initial begin
         $readmemh(CFG_FILE, cfg_rom);
         $readmemh(IMG_FILE, img_rom);
@@ -71,13 +73,13 @@ module top #(
     logic         cfg_we, in_we, start, busy, done;
     logic [1:0]   cfg_addr;
     logic [143:0] cfg_data;
-    logic [9:0]   in_addr;
+    logic [A_AW-1:0] in_addr;
     logic [63:0]  in_data;
     logic [7:0]   class_idx;
 
     /* verilator lint_off PINCONNECTEMPTY */
     nn_accel #(
-        .W_AW(10), .A_AW(10),
+        .W_AW(10), .A_AW(A_AW),
         .W_FILE(W_FILE),
         .B_FILE(B_FILE)
     ) u_accel (
@@ -90,21 +92,21 @@ module top #(
     // ------------------------------------------------------- sequencer
     typedef enum logic [2:0] {T_CFG, T_IMG, T_START, T_WAIT, T_SHOW} tstate_t;
     tstate_t     tstate;
-    logic [10:0] cnt;          // layer index, then pixel index
-    logic [7:0]  pixel;        // synchronous ROM read
+    logic [10:0] cnt;          // layer index, then input word index
+    logic [63:0] pixel;        // synchronous ROM read
     logic        pixel_v;
-    logic [9:0]  pixel_addr;
+    logic [A_AW-1:0] pixel_addr;
     logic [3:0]  result;
     logic        have_result;
 
-    always_ff @(posedge clk) pixel <= img_rom[cnt[9:0]];
+    always_ff @(posedge clk) pixel <= img_rom[cnt[A_AW-1:0]];
 
     assign cfg_data = cfg_rom[cnt[1:0]];
     assign cfg_addr = cnt[1:0];
     assign cfg_we   = (tstate == T_CFG);
     assign in_we    = pixel_v;
     assign in_addr  = pixel_addr;
-    assign in_data  = {56'd0, pixel};
+    assign in_data  = pixel;
     assign start    = (tstate == T_START);
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -117,7 +119,7 @@ module top #(
             have_result <= 1'b0;
         end else begin
             pixel_v    <= (tstate == T_IMG);
-            pixel_addr <= cnt[9:0];
+            pixel_addr <= cnt[A_AW-1:0];
 
             case (tstate)
                 T_CFG: begin

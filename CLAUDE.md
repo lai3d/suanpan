@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-suanpan is an INT8 neural-network inference accelerator written in SystemVerilog, developed in three stages (see `docs/three-stages.md`; a Chinese translation sits next to it and the two must be kept in sync). Stage 1 is done: RTL verified in simulation against a bit-exact integer model, plus pre-layout synthesis estimates. Stage 2 is in progress: a Tang Nano 20K demo builds to a bitstream and passes gate-level simulation, but has not been run on a board. There is no tapeout flow.
+suanpan is an INT8 neural-network inference accelerator written in SystemVerilog, developed in three stages (see `docs/three-stages.md`). `README.md` and `docs/three-stages.md` each have a Chinese translation next to them (`*.zh-CN.md`); whenever you change one, change the other in the same commit, including every number. Stage 1 is done: RTL verified in simulation against a bit-exact integer model, plus pre-layout synthesis estimates. Stage 2 is in progress: a Tang Nano 20K demo builds to a bitstream and passes gate-level simulation, but has not been run on a board. There is no tapeout flow.
 
 ## Commands
 
@@ -26,7 +26,7 @@ make fpga-gatesim  # simulate the placed-and-routed netlist
 The `fpga` targets need the OSS CAD Suite on `PATH` (Homebrew has no `nextpnr-himbaechel`). Vendor tools are not an option on macOS.
 
 - `ARCH=cnn` (default), `ARCH=mlp` or `ARCH=stress` selects the network for `model`, `sim`, `sim-full` and `wave`. Each has its own `build/<arch>/` directory.
-- The quickest check after an RTL change is `make sim N=5`. Before finishing, run `make lint` and `make sim-full` for `ARCH=cnn`, `ARCH=mlp` and `ARCH=stress`; CI runs all three. The MLP exercises the fully-connected path as a degenerate convolution. `stress` is not a useful network: it exists to hit hardware corner cases (a hidden layer with one-word windows, which forces the front end to wait for the post unit, and a layer width that is not a multiple of 8). If you add a corner case to the RTL, extend `stress` to reach it.
+- The quickest check after an RTL change is `make sim N=5`. Before finishing, run `make lint` and `make sim-full` for `ARCH=cnn`, `ARCH=mlp` and `ARCH=stress`; CI runs all three. The MLP exercises the fully-connected path as a degenerate convolution. `stress` is not a useful network: it exists to hit hardware corner cases (a hidden layer with one-word windows, so outputs complete on consecutive cycles; a single-channel input padded to 8; and a layer width that is not a multiple of 8). If you add a corner case to the RTL, extend `stress` to reach it.
 - `sim` and `sim-full` exit non-zero unless the testbench prints `RESULT: PASS`.
 - Verilator's generated makefile cannot build in a path containing spaces. If the checkout lives under one, pass `VOBJ=<dir without spaces>` to `make sim-full`.
 - `make model` downloads MNIST into `data/` on first run. `build/`, `data/` and `.venv/` are not committed.
@@ -49,9 +49,15 @@ The hardware is network-agnostic. A network is three memory images produced by `
 
 **The layer table is the contract between Python and RTL.** Each layer is one 144-bit descriptor. Its bit layout is defined twice and must stay in sync: `cfg_word()` in `model/train.py` and the header comment plus the `S_LOAD` state in `rtl/nn_accel.sv`. `compile_program()` in `train.py` is where a layer's geometry is turned into those fields and where weights are packed in the order the hardware reads them (per output channel: `ky`, `kx`, padded channel).
 
-**Control flow in `nn_accel.sv`.** Two state machines run concurrently. The front end (`state`) issues addresses in `S_MAC` and, on the last word of an output, advances the channel / pixel / row counters and goes straight on to the next output. A 3-stage pipeline (`v1`/`v2`/`v3`: registered products, adder tree, accumulate) trails it, with `f*`/`l*` tags marking the first and last word of each output. The accumulator starts from the bias on the first word. When the last word reaches stage 3 (`handoff`), the sum moves to the post unit (`pstate`), which requantizes over several cycles (`P_MUL`…`P_CLAMP`) and writes the byte in `P_OUT`. Output bytes are assembled into a full word before being written. Two activation buffers ping-pong, selected by `layer[0]`.
+**Control flow in `nn_accel.sv`.** Only address generation is a state machine; everything after it is a feed-forward pipeline. The front end (`state`) issues one memory word per cycle in `S_MAC` and, on the last word of an output, moves the channel / pixel / row counters on so that the next output's first word follows in the very next cycle. Words flow through four stages (`v0`..`v3`: registered operands, registered products, adder tree, accumulate) carrying tags: `f` first word of an output, `l` last word, `e` last word of the layer. The accumulator starts from the bias on the first word. When a last word reaches stage 3 (`handoff`) the sum enters the post pipeline (`pv[0..6]`): four 9x17 multiplies, two combine stages, round, shift, clamp, write. Output bytes are assembled into a full word before being written. Two activation buffers ping-pong, selected by `layer[0]`.
 
-Two timing rules hold this together. The post unit is busy for 9 cycles, so `S_NEURON` holds off until `POST_GAP` cycles have passed since the previous output started (`cool`); this only bites when a window is shorter than 9 words. And the front end drains everything in flight (`S_DRAIN`) before changing layer, because the next layer reads the buffer the current one is still writing and the post unit uses the per-layer constants.
+Things that follow from this design:
+
+- An output costs exactly as many cycles as its window has words, so windows can be one word long and several outputs can be in flight at once. Per-output state must travel as tags or be counted on the post side (`o_cnt`); a single "current output" register is not enough.
+- `b_q` holds an output's bias for only one cycle when windows are one word long, which is why it is captured at stage 0 and carried along (`bias_r0..2`).
+- The front end drains everything in flight (`S_DRAIN`) before changing layer, because the next layer reads the buffer the current one is still writing and the post pipeline uses the per-layer constants.
+
+**Input layout is part of the model.** The default CNN stores its input space-to-depth (`"s2d": 2` in `ARCHS`, see `prep()` in `train.py`): 2x2 pixel blocks become 4-channel pixels. It is a pure rearrangement done by the exporter; the hardware does not know about it. Anything that feeds images to the accelerator (the testbench's `images.hex`, the FPGA demo ROM) must use the same layout.
 
 **Memories are black boxes in synthesis.** `rtl/sram_sp.sv` is a behavioral synchronous-read memory standing in for SRAM macros. `syn/synth.sh` reads it with `-lib`, so reported area and timing cover logic only. The testbench loads weight and bias images by hierarchical reference (`dut.u_wmem.mem`).
 
@@ -68,7 +74,7 @@ Two timing rules hold this together. The post unit is busy for 9 cycles, so `S_N
 
 - **A failing gate-level simulation is not automatically a design bug.** Yosys' Gowin simulation library declares the block RAM (`SPX9`) and the multipliers as black boxes, so their outputs are X. `fpga/gowin_sim.v` holds behavioural models written from Yosys' own mapping files (`brams_map.v`, `dsp_map.v`), and `fpga/gatesim.sh` swaps them in. If synthesis starts using a cell that has no model there, the symptom is X on the outputs with a correct cycle count.
 - **Partially initialized ROMs look uninitialized in a dump.** Yosys prints `INIT` MSB-first, so a ROM whose upper addresses are unused starts with a long run of `x`. Count defined bits before concluding a `$readmemh` did not load.
-- **The bias table is forced into logic** in `fpga/tangnano20k/build.sh`. As a block RAM it is the only 36-bit-wide `SPX9`, and nextpnr reports 35 hold violations on its address pins for every seed.
+- **Block RAMs are limited to 18-bit data** in `fpga/tangnano20k/build.sh`, by running the memory-mapping step of `synth_gowin` by hand with a copy of Yosys' `brams.txt` that omits width 36. Any 36-bit `SPX9` makes nextpnr report hold violations on its `ADB*` pins, for every seed. Small, wide memories are the ones Yosys maps that way, so shrinking a buffer can make the violations appear.
 - **Board facts.** Pins are from Sipeed's example repo (clock 4, LEDs 15-20 active low, button 88). The button's polarity is unverified, which is why the wrapper triggers on any debounced change.
 
 ## Reporting numbers
