@@ -26,7 +26,7 @@
 module top #(
     // Memory images, read at synthesis time (paths relative to the repo root).
     parameter     W_FILE    = "build/cnn/weights.hex",
-    parameter     B_FILE    = "build/cnn/bias.hex",
+    parameter     B_FILE    = "build/cnn/params.hex",
     parameter     CFG_FILE  = "build/cnn/cfg.hex",
     parameter     IMG_FILE  = "build/cnn/demo_image.hex",
     parameter int N_LAYERS  = 3,
@@ -85,7 +85,7 @@ module top #(
         .clk, .rst_n, .data(tx_data), .valid(tx_valid), .ready(tx_ready), .tx(uart_tx));
 
     // ------------------------------------------------------------ ROMs
-    logic [143:0] cfg_rom [0:3];
+    logic [175:0] cfg_rom [0:7];
     logic [63:0]  img_rom [0:(1<<A_AW)-1];
     initial begin
         $readmemh(CFG_FILE, cfg_rom);
@@ -94,8 +94,8 @@ module top #(
 
     // ----------------------------------------------------- accelerator
     logic         cfg_we, in_we, start, busy, done, logit_valid;
-    logic [1:0]   cfg_addr;
-    logic [143:0] cfg_data;
+    logic [2:0]   cfg_addr;
+    logic [175:0] cfg_data;
     logic [A_AW-1:0] in_addr;
     logic [63:0]  in_data;
     logic [7:0]   class_idx, logit_idx;
@@ -107,7 +107,7 @@ module top #(
         .B_FILE(B_FILE)
     ) u_accel (
         .clk, .rst_n, .cfg_we, .cfg_addr, .cfg_data, .in_we, .in_addr, .in_data,
-        .start, .num_layers(3'(N_LAYERS)), .busy, .done, .class_idx,
+        .start, .num_layers(4'(N_LAYERS)), .busy, .done, .class_idx,
         .logit_valid, .logit_idx, .logit_data
     );
 
@@ -156,8 +156,8 @@ module top #(
 
     always_ff @(posedge clk) pixel <= img_rom[cnt[A_AW-1:0]];
 
-    assign cfg_data = cfg_rom[cnt[1:0]];
-    assign cfg_addr = cnt[1:0];
+    assign cfg_data = cfg_rom[cnt[2:0]];
+    assign cfg_addr = cnt[2:0];
     assign cfg_we   = (tstate == T_CFG);
     assign in_we    = pixel_v | uw_we;
     assign in_addr  = uw_we ? uw_addr : pixel_addr;

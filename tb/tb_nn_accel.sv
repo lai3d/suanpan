@@ -11,7 +11,7 @@
 module tb_nn_accel;
     localparam int P          = 8;
     localparam int A_AW       = 10;
-    localparam int MAX_LAYERS = 4;
+    localparam int MAX_LAYERS = 8;
     localparam int MAX_N      = 10000;
     localparam int MAX_IN     = 1 << A_AW;   // input words per image
     localparam int MAX_OUT    = 16;
@@ -20,13 +20,13 @@ module tb_nn_accel;
     always #5 clk = ~clk;              // 100 MHz
 
     logic               cfg_we = 0;
-    logic [1:0]         cfg_addr = 0;
-    logic [143:0]       cfg_data = 0;
+    logic [2:0]         cfg_addr = 0;
+    logic [175:0]       cfg_data = 0;
     logic               in_we = 0;
     logic [A_AW-1:0]    in_addr = 0;
     logic [63:0]        in_data = 0;
     logic               start = 0;
-    logic [2:0]         num_layers = 0;
+    logic [3:0]         num_layers = 0;
     logic               busy, done, logit_valid;
     logic [7:0]         class_idx, logit_idx;
     logic signed [31:0] logit_data;
@@ -43,7 +43,7 @@ module tb_nn_accel;
         .logit_valid, .logit_idx, .logit_data
     );
 
-    logic [143:0] cfg_rom  [0:MAX_LAYERS-1];
+    logic [175:0] cfg_rom  [0:MAX_LAYERS-1];
     logic [31:0]  meta     [0:2];            // in_words, n_layers, n_out
     logic [63:0]  images   [0:MAX_N*MAX_IN-1];
     logic [7:0]   labels   [0:MAX_N-1];
@@ -74,10 +74,10 @@ module tb_nn_accel;
             $dumpfile("build/tb.vcd");
             $dumpvars(0, tb_nn_accel);
         end
-        // weight and bias memories are ROM images on the chip
+        // weight and parameter memories are ROM images on the chip
 `ifndef GATE
         $readmemh({mem, "/weights.hex"}, dut.u_wmem.mem);
-        $readmemh({mem, "/bias.hex"}, dut.u_bmem.mem);
+        $readmemh({mem, "/params.hex"}, dut.u_bmem.mem);
 `endif
         $readmemh({mem, "/cfg.hex"}, cfg_rom);
         $readmemh({mem, "/meta.hex"}, meta);
@@ -95,10 +95,10 @@ module tb_nn_accel;
         @(posedge clk);
 
         // program the layer table
-        num_layers <= n_layers[2:0];
+        num_layers <= n_layers[3:0];
         for (int l = 0; l < n_layers; l++) begin
             cfg_we   <= 1;
-            cfg_addr <= l[1:0];
+            cfg_addr <= l[2:0];
             cfg_data <= cfg_rom[l];
             @(posedge clk);
         end
