@@ -15,24 +15,14 @@ nnc.py and are shared with the ONNX path (tools/compile.py). --onnx also
 writes the trained float model as ONNX, in its plain image-space form.
 """
 import argparse
-import gzip
-import struct
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 
+import datasets
 import nnc
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
-MIRROR = "https://ossci-datasets.s3.amazonaws.com/mnist/"
-FILES = {
-    "train_x": "train-images-idx3-ubyte.gz",
-    "train_y": "train-labels-idx1-ubyte.gz",
-    "test_x": "t10k-images-idx3-ubyte.gz",
-    "test_y": "t10k-labels-idx1-ubyte.gz",
-}
 
 # "input" is the tensor the first layer reads. See nnc.py for the layer specs.
 ARCHS = {
@@ -55,24 +45,6 @@ ARCHS = {
                           ("conv", 3, 2, 16, 1), ("pool", 2, 2), ("fc", 20), ("fc", 10)],
                "epochs": 2, "lr": 0.05},
 }
-
-
-def load_mnist():
-    """MNIST as flat uint8 images and labels; downloaded on first use."""
-    DATA.mkdir(parents=True, exist_ok=True)
-    out = {}
-    for key, name in FILES.items():
-        path = DATA / name
-        if not path.exists():
-            print(f"downloading {name}")
-            urllib.request.urlretrieve(MIRROR + name, path)
-        raw = gzip.open(path, "rb").read()
-        if key.endswith("_x"):
-            _, n, r, c = struct.unpack(">IIII", raw[:16])
-            out[key] = np.frombuffer(raw, np.uint8, offset=16).reshape(n, r * c)
-        else:
-            out[key] = np.frombuffer(raw, np.uint8, offset=8)
-    return out
 
 
 def prep(arch, x):
@@ -179,9 +151,10 @@ def main():
     geo = nnc.geometry(arch["input"], arch["layers"])
     out = ROOT / "build" / args.arch
 
-    d = load_mnist()
-    xtr, xte = (d["train_x"] >> 1).astype(np.int64), (d["test_x"] >> 1).astype(np.int64)
-    ytr, yte = d["train_y"].astype(np.int64), d["test_y"].astype(np.int64)
+    d = datasets.load_mnist()
+    xtr = (d["train_x"].reshape(-1, 784) >> 1).astype(np.int64)
+    xte = (d["test_x"].reshape(-1, 784) >> 1).astype(np.int64)
+    ytr, yte = d["train_y"], d["test_y"]
 
     fparams = train(arch, geo, xtr, ytr)
     fl = nnc.float_forward(geo, fparams, prep(arch, xte.astype(np.float32) / 127.0)).argmax(1)

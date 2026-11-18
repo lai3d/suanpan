@@ -19,6 +19,8 @@ make lint       # verilator --lint-only -Wall on the RTL
 make synth      # Yosys + ABC onto SKY130, PERIOD=<ps>
 make test-compiler   # compiler tests incl. byte-exact ONNX round trip
 make lenet5          # compile examples/lenet5.onnx -> build/lenet5
+make cifar10         # compile examples/cifar10.onnx (downloads CIFAR-10, 163 MB)
+make cifar10-ci      # same network from the small .npz subsets in examples/
 
 make fpga-sim      # Tang Nano 20K wrapper in RTL simulation
 make fpga          # synth_gowin + nextpnr-himbaechel + gowin_pack -> build/fpga/top.fs
@@ -30,7 +32,8 @@ The `fpga` targets need the OSS CAD Suite on `PATH` (Homebrew has no `nextpnr-hi
 
 - `ARCH=cnn` (default), `ARCH=mlp` or `ARCH=stress` selects the network for `model`, `sim`, `sim-full` and `wave`. Each has its own `build/<arch>/` directory. `MEM=<dir>` points the simulation at any compiled network instead, e.g. `make sim-full MEM=build/lenet5 N_FULL=300`.
 - `make test-compiler` needs `make model` to have been run for `cnn`, `mlp` and `stress`, because it round-trips their ONNX files.
-- `examples/lenet5.onnx` is committed. Regenerating it needs PyTorch, which is not in the project environment: `uv run --python 3.13 --with torch --with onnx examples/train_lenet5.py`.
+- **CI has a 45-minute limit and has hit a limit before.** It runs every network; a 10,000-image run of a large network takes minutes there. When adding a network or lengthening a test, check the step timings of a recent run and trim image counts (`N`, `N_FULL`) rather than letting the job time out, which shows up as "cancelled", not as a failure. CIFAR-10 runs in CI from `examples/cifar10_*.npz` (32 test images) because the dataset server is slow.
+- `examples/lenet5.onnx` and `examples/cifar10.onnx` are committed. Regenerating them needs PyTorch, which is not in the project environment: `uv run --python 3.13 --with torch --with onnx examples/train_lenet5.py`. That interpreter may lack system certificates, so let the project environment download a dataset first (`python model/datasets.py cifar10 examples` does, and also rewrites the CI subsets); do not disable certificate checks.
 - The quickest check after an RTL change is `make sim N=5`. Before finishing, run `make lint` and `make sim-full` for `ARCH=cnn`, `ARCH=mlp` and `ARCH=stress`; CI runs all three. The MLP exercises the fully-connected path as a degenerate convolution. `stress` is not a useful network: it exists to hit hardware corner cases (padded convolutions at stride 1 and 2, max pooling over one-word and two-word pixels, a hidden layer with one-word windows so outputs complete on consecutive cycles, a single-channel input padded to 8, and a layer width that is not a multiple of 8). If you add a corner case to the RTL, extend `stress` to reach it.
 - `sim` and `sim-full` exit non-zero unless the testbench prints `RESULT: PASS`.
 - Verilator's generated makefile cannot build in a path containing spaces. If the checkout lives under one, pass `VOBJ=<dir without spaces>` to `make sim-full`.

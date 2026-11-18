@@ -33,7 +33,7 @@ import numpy as np
 P = 8  # MAC lanes == bytes per memory word
 
 # Capacity of the hardware as configured by default (see rtl/nn_accel.sv).
-LIMITS = dict(W_AW=13, A_AW=10, B_AW=8, MAX_LAYERS=8, MAX_OUT=16)
+LIMITS = dict(W_AW=13, A_AW=11, B_AW=8, MAX_LAYERS=8, MAX_OUT=16)
 
 
 class CompileError(Exception):
