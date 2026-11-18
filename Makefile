@@ -15,14 +15,16 @@ model build/mem/weights.hex:
 # Quick check with Icarus Verilog (N images, default 100).
 sim: build/mem/weights.hex
 	iverilog -g2012 -o build/tb.vvp $(RTL) $(TB)
-	vvp -n build/tb.vvp +N=$(N)
+	vvp -n build/tb.vvp +N=$(N) | tee build/sim.log
+	@grep -q "RESULT: PASS" build/sim.log
 
 # Full 10,000-image test set with Verilator (compiled, much faster).
 sim-full: build/mem/weights.hex
 	verilator --binary --timing -Wno-fatal -O3 --Mdir $(VOBJ) \
 	    --top-module tb_nn_accel -o tb $(RTL) $(TB) > build/verilator.log 2>&1 \
 	    || (cat build/verilator.log; exit 1)
-	$(VOBJ)/tb +N=10000
+	$(VOBJ)/tb +N=10000 | tee build/sim-full.log
+	@grep -q "RESULT: PASS" build/sim-full.log
 
 # Dump a waveform for one image -> build/tb.vcd
 wave: build/mem/weights.hex
