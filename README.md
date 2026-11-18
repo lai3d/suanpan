@@ -43,6 +43,53 @@ The CNN's input is stored space-to-depth: each 2×2 block of pixels becomes one
 rearrangement. A 2×2 convolution on it is the same arithmetic as a 4×4
 stride-2 convolution on the image, but its window is 4 memory words.
 
+## Bring your own model
+
+`tools/compile.py` turns an ONNX model, as exported by PyTorch or another
+framework, into the accelerator's memory images and a set of golden vectors
+for the testbench.
+
+```bash
+python tools/compile.py examples/lenet5.onnx --out build/lenet5 --data mnist
+make sim-full MEM=build/lenet5
+```
+
+`examples/lenet5.onnx` is the classic LeNet-5, trained in PyTorch by
+`examples/train_lenet5.py` with no knowledge of this hardware:
+
+| LeNet-5 from PyTorch | |
+|---|---|
+| Layers | conv 5×5 pad 2 ×6 → pool → conv 5×5 ×16 → pool → fc 120 → fc 84 → fc 10 |
+| Accuracy, float / INT8 | 98.92% / 98.89% |
+| INT8 picks the float model's class | 99.93% of test images |
+| RTL vs golden model, 10,000 images | 0 mismatches |
+| Weights | 63.8 KB |
+| Clock cycles per inference | 205,247 |
+
+What the compiler does:
+
+- **Imports** a chain of Conv, BatchNormalization (folded into the
+  convolution), Relu, MaxPool, Flatten and Gemm / MatMul + Add.
+- **Rewrites** the network without changing what it computes: convolution
+  channel counts are rounded up to a multiple of 8 with all-zero filters
+  (LeNet's 6 becomes 8); a leading fully-connected layer gets a densely packed
+  input; an even-sized stride-2 first convolution is moved onto a
+  space-to-depth input.
+- **Quantizes** to INT8 after training, using calibration images.
+- **Checks** the result against the hardware's capacity and refuses, with a
+  message naming the limit, when the network does not fit.
+- **Writes** the memory images plus the outputs of a bit-exact integer model,
+  which is what the RTL is compared against.
+
+Requirements on the model: one input, a single chain of layers, images scaled
+to [0, 1] with no other normalization, ReLU after every hidden convolution or
+fully-connected layer, raw logits at the end. Anything else is rejected with
+an explanation rather than compiled approximately.
+
+The compiler is tested against itself: the networks trained by
+`model/train.py` are exported to ONNX and compiled back, and all nine output
+files must be byte-identical (`make test-compiler`).
+
 ## Synthesis estimate (SKY130, pre-layout)
 
 Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
@@ -54,7 +101,7 @@ Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
 | Logic area | 141,917 µm² (0.142 mm²), 27% of it sequential |
 | Longest combinational path | 2.6 ns → roughly 380 MHz |
 | Time per inference at that clock | CNN ≈ 30 µs, MLP ≈ 17 µs |
-| Memory as configured | 664 kbit: weights 524 kbit, 2 × 66 kbit activations, 7 kbit parameters, 1 kbit layer table |
+| Memory as configured | 671 kbit: weights 524 kbit, 2 × 66 kbit activations, 14 kbit parameters, 1 kbit layer table |
 | Memory the CNN alone needs | 107 kbit: weights 66 kbit, 2 × 16 kbit activations, 7 kbit parameters, 1 kbit layer table |
 
 These are logic-synthesis estimates, not sign-off numbers: there is no
@@ -125,9 +172,9 @@ It builds with the open-source flow (Yosys, nextpnr-himbaechel, gowin_pack):
 
 | Metric | Value |
 |---|---|
-| Timing | 88 MHz achievable, 27 MHz required (board oscillator) |
-| LUT4 | 2,780 of 20,736 (13%) |
-| Flip-flops | 2,163 of 15,552 (14%) |
+| Timing | 85 MHz achievable, 27 MHz required (board oscillator) |
+| LUT4 | 2,770 of 20,736 (13%) |
+| Flip-flops | 2,166 of 15,552 (14%) |
 | Block RAM | 17 of 46 (37%) |
 | DSP multipliers | 8 × 9×9 and 4 × 18×18 |
 
@@ -171,7 +218,7 @@ flowchart LR
 
     subgraph mem[Memories]
         wmem[(Weights<br/>8192 × 64 bit)]
-        bmem[(Parameters<br/>128 × 54 bit)]
+        bmem[(Parameters<br/>256 × 54 bit)]
         bufa[(Activation<br/>buffer A<br/>1024 × 64 bit)]
         bufb[(Activation<br/>buffer B<br/>1024 × 64 bit)]
     end
@@ -239,8 +286,9 @@ expressed.
   next to the bias. The last layer keeps one scale for all outputs, because
   its raw sums are compared with each other.
 
-Limits: convolution output channels must be a multiple of 8, pooling is max
-only, and a network has at most 8 layers.
+Limits: pooling is max only, a network has at most 8 layers, and convolution
+outputs are written a word at a time, so their channel count is a multiple of
+8 (the compiler pads it).
 
 ### Files
 
@@ -251,8 +299,12 @@ only, and a network has at most 8 layers.
   of layer descriptors written by the host, so a different network only needs
   new memory images, not new RTL.
 - `rtl/sram_sp.sv` — synchronous-read memory (SRAM macro / block RAM).
-- `model/train.py` — numpy training, quantization, memory-image export, and
-  the bit-exact integer reference model.
+- `model/nnc.py` — the compiler core: rewrites, quantization, the bit-exact
+  integer reference model, memory-image export.
+- `model/onnx_io.py`, `tools/compile.py` — ONNX front end and command line.
+- `model/train.py` — numpy training of the built-in networks.
+- `examples/` — LeNet-5 trained in PyTorch, and its ONNX file.
+- `tests/test_compiler.py` — compiler tests.
 - `tb/tb_nn_accel.sv` — self-checking testbench.
 - `fpga/` — Tang Nano 20K demo, UART, build script and gate-level simulation
   models.
@@ -261,7 +313,7 @@ only, and a network has at most 8 layers.
 ## Run
 
 Requires `iverilog`, `verilator` (plus `yosys` for synthesis) and Python with
-`numpy` (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
+`numpy` and `onnx` (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
 
 ```bash
 make model      # downloads MNIST, trains, writes build/cnn/*.hex
@@ -270,6 +322,7 @@ make sim-full   # all 10,000 images, Verilator
 make wave       # one image, dumps build/tb.vcd
 make lint
 make synth      # SKY130 logic synthesis (needs yosys), PERIOD=<ps>
+make test-compiler
 
 make fpga-sim      # Tang Nano 20K wrapper, RTL simulation
 make fpga          # synthesis, place and route -> build/fpga/top.fs

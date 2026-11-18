@@ -65,7 +65,7 @@ module nn_accel #(
     parameter int P          = 8,    // MAC lanes (bytes per memory word)
     parameter int W_AW       = 13,   // weight memory address bits (words)
     parameter int A_AW       = 10,   // activation buffer address bits (words)
-    parameter int B_AW       = 7,    // parameter memory address bits
+    parameter int B_AW       = 8,    // parameter memory address bits
     parameter int MAX_LAYERS = 8,
     // optional $readmemh images for the weight and parameter memories (ROM use)
     parameter     W_FILE     = "",

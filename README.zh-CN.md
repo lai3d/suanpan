@@ -28,6 +28,38 @@
 
 CNN 的输入按 space-to-depth 方式存放：每个 2×2 像素块变成一个 4 通道的像素，28×28 的图就成了 14×14×4 的张量。这只是重新排列，没有任何计算。在它上面做 2×2 卷积，与在原图上做 4×4、步长 2 的卷积是同一套算术，但窗口只占 4 个存储字。
 
+## 使用你自己的模型
+
+`tools/compile.py` 把 ONNX 模型（由 PyTorch 或其他框架导出）转换成加速器的存储镜像，以及一组供测试平台使用的黄金向量。
+
+```bash
+python tools/compile.py examples/lenet5.onnx --out build/lenet5 --data mnist
+make sim-full MEM=build/lenet5
+```
+
+`examples/lenet5.onnx` 是经典的 LeNet-5，由 `examples/train_lenet5.py` 用 PyTorch 训练，训练时完全不知道这套硬件的存在：
+
+| 来自 PyTorch 的 LeNet-5 | |
+|---|---|
+| 结构 | conv 5×5 填充 2 ×6 → pool → conv 5×5 ×16 → pool → fc 120 → fc 84 → fc 10 |
+| 准确率，浮点 / INT8 | 98.92% / 98.89% |
+| INT8 与浮点模型选出同一类别 | 测试图的 99.93% |
+| RTL 对比黄金模型，10,000 张图 | 0 处不一致 |
+| 权重 | 63.8 KB |
+| 每次推理的时钟周期数 | 205,247 |
+
+编译器做的事：
+
+- **导入**由 Conv、BatchNormalization（折叠进卷积）、Relu、MaxPool、Flatten 和 Gemm（或 MatMul 加 Add）串成的一条链。
+- **改写**网络但不改变它的计算结果：卷积的通道数用全零的卷积核补齐到 8 的倍数（LeNet 的 6 变成 8）；以全连接层开头的网络，输入改成紧凑排布；偶数尺寸、步长为 2 的首层卷积，改到 space-to-depth 排布的输入上。
+- **量化**成 INT8，采用训练后量化，需要一批校准图像。
+- **检查**结果是否超出硬件的容量；装不下时拒绝编译，并在报错里指出是哪一项超了。
+- **写出**存储镜像，以及逐位一致的整数模型的输出，RTL 就是和它比对的。
+
+对模型的要求：单输入，各层串成一条链，图像缩放到 [0, 1] 且不做其他归一化，每个隐藏的卷积层或全连接层后面跟 ReLU，最后输出原始 logit。不满足时编译器会报错并说明原因，而不是凑合着编译出一个近似的结果。
+
+编译器用自身做了验证：`model/train.py` 训练的网络先导出成 ONNX 再编译回来，九个输出文件必须逐字节相同（`make test-compiler`）。
+
 ## 综合估算（SKY130，布局布线前）
 
 用 Yosys + ABC 综合到开源的 `sky130_fd_sc_hd` 单元库，典型工艺角（1.8 V，25 °C），不计连线负载。存储器按黑盒处理，单独统计。
@@ -38,7 +70,7 @@ CNN 的输入按 space-to-depth 方式存放：每个 2×2 像素块变成一个
 | 逻辑面积 | 141,917 µm²（0.142 mm²），其中 27% 是时序单元 |
 | 最长组合路径 | 2.6 ns，约 380 MHz |
 | 按此主频的单次推理时间 | CNN 约 30 µs，MLP 约 17 µs |
-| 当前配置的存储 | 664 kbit：权重 524 kbit，激活缓冲 2 × 66 kbit，参数 7 kbit，层配置表 1 kbit |
+| 当前配置的存储 | 671 kbit：权重 524 kbit，激活缓冲 2 × 66 kbit，参数 14 kbit，层配置表 1 kbit |
 | 只跑 CNN 所需的存储 | 107 kbit：权重 66 kbit，激活缓冲 2 × 16 kbit，参数 7 kbit，层配置表 1 kbit |
 
 这些是逻辑综合阶段的估算，不是签核数据：还没有布局、布线、时钟树和 SRAM 宏（真实主频很可能由 SRAM 的读取时间决定），功耗也没有评估。主导芯片面积的会是存储器，而且差距很大，不是逻辑。
@@ -79,9 +111,9 @@ CNN 的输入按 space-to-depth 方式存放：每个 2×2 像素块变成一个
 
 | 指标 | 数值 |
 |---|---|
-| 时序 | 可达 88 MHz，要求 27 MHz（板载晶振） |
-| LUT4 | 2,780 / 20,736（13%） |
-| 触发器 | 2,163 / 15,552（14%） |
+| 时序 | 可达 85 MHz，要求 27 MHz（板载晶振） |
+| LUT4 | 2,770 / 20,736（13%） |
+| 触发器 | 2,166 / 15,552（14%） |
 | 块 RAM | 17 / 46（37%） |
 | DSP 乘法器 | 8 个 9×9，4 个 18×18 |
 
@@ -112,7 +144,7 @@ flowchart LR
 
     subgraph mem[存储器]
         wmem[(权重<br/>8192 × 64 位)]
-        bmem[(参数<br/>128 × 54 位)]
+        bmem[(参数<br/>256 × 54 位)]
         bufa[(激活缓冲 A<br/>1024 × 64 位)]
         bufb[(激活缓冲 B<br/>1024 × 64 位)]
     end
@@ -165,21 +197,25 @@ flowchart LR
 - **最大池化**：不经过乘法器。通道是 8 个一组打包在一个字里的，所以最大值按整字来取，一次比较 8 路，结果直接写回。
 - **重量化**：每个输出通道有自己的乘数和移位量，和偏置存在一起。最后一层所有输出共用一个系数，因为它的原始累加值之间要互相比较。
 
-限制：卷积的输出通道数必须是 8 的倍数，池化只有最大池化，一个网络最多 8 层。
+限制：池化只有最大池化；一个网络最多 8 层；卷积的输出是按整字写入的，所以通道数是 8 的倍数（由编译器补齐）。
 
 ### 文件
 
 - `rtl/dot_unit.sv`：8 路有符号 8×8 点积（计算核心），寄存的乘法器接平衡加法树。
 - `rtl/nn_accel.sv`：带窗口寻址的前端状态机、MAC 流水线、后处理流水线（重量化、写回、argmax）。网络是主机写入的一张层描述表，所以换一个网络只需要新的存储镜像，不需要改 RTL。
 - `rtl/sram_sp.sv`：同步读存储器（对应 SRAM 宏或块 RAM）。
-- `model/train.py`：numpy 训练、量化、存储镜像导出，以及逐位一致的整数参考模型。
+- `model/nnc.py`：编译器核心，包括改写、量化、逐位一致的整数参考模型和存储镜像导出。
+- `model/onnx_io.py`、`tools/compile.py`：ONNX 前端和命令行。
+- `model/train.py`：用 numpy 训练内置的几个网络。
+- `examples/`：用 PyTorch 训练的 LeNet-5 及其 ONNX 文件。
+- `tests/test_compiler.py`：编译器的测试。
 - `tb/tb_nn_accel.sv`：自检测试平台。
 - `fpga/`：Tang Nano 20K 演示工程、串口、构建脚本和门级仿真模型。
 - `tools/host.py`：串口接口的主机端。
 
 ## 运行
 
-需要 `iverilog`、`verilator`（综合还需要 `yosys`），以及带 `numpy` 的 Python（`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`）。
+需要 `iverilog`、`verilator`（综合还需要 `yosys`），以及带 `numpy` 和 `onnx` 的 Python（`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`）。
 
 ```bash
 make model      # 下载 MNIST、训练、写出 build/cnn/*.hex
@@ -188,6 +224,7 @@ make sim-full   # 全部 10,000 张图，Verilator
 make wave       # 一张图，输出波形 build/tb.vcd
 make lint
 make synth      # SKY130 逻辑综合（需要 yosys），PERIOD=<皮秒>
+make test-compiler
 
 make fpga-sim      # Tang Nano 20K 顶层，RTL 仿真
 make fpga          # 综合、布局布线，生成 build/fpga/top.fs
