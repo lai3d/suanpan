@@ -12,7 +12,7 @@ each one means, costs and proves is in [docs/three-stages.md](docs/three-stages.
 ([中文版](docs/three-stages.zh-CN.md)).
 
 **Stage 1 (done): RTL + simulation.** A from-scratch hardware accelerator
-for INT8 convolutional and fully-connected inference, verified bit-exactly in
+for INT8 inference with convolution, max pooling and fully-connected layers, verified bit-exactly in
 simulation against an integer golden model on MNIST.
 
 ## Status
@@ -22,20 +22,20 @@ Two networks run on the same hardware; only the memory images differ.
 | | CNN (default) | MLP |
 |---|---|---|
 | Layers | conv 4×4/2 ×8 → conv 3×3/2 ×16 → fc 10 | fc 64 → fc 10 |
-| Accuracy, float / INT8 | 98.61% / 98.59% | 97.52% / 97.48% |
+| Accuracy, float / INT8 | 98.61% / 98.60% | 97.52% / 97.49% |
 | Weights | 7.2 KB | 50.8 KB |
 | RTL vs golden model, 10,000 images | 0 mismatches | 0 mismatches |
-| Clock cycles per inference | 11,352 | 6,377 |
+| Clock cycles per inference | 11,355 | 6,379 |
 
 Accuracy is on the 10,000-image MNIST test set, post-training quantization.
 "0 mismatches" means all 100,000 logits and 10,000 predicted classes match.
 A third network, `stress`, exists only to exercise hardware corner cases
-(one-word windows, a padded single-channel input, odd layer widths) and is
-checked the same way.
+(padded convolutions, max pooling, one-word windows, a single-channel input,
+odd layer widths) and is checked the same way.
 
 An output value costs exactly as many cycles as its window has memory words.
 Everything after address generation is a feed-forward pipeline, so the front
-end issues consecutive outputs back to back. Of the CNN's 11,352 cycles,
+end issues consecutive outputs back to back. Of the CNN's 11,355 cycles,
 11,312 are multiply-accumulate.
 
 The CNN's input is stored space-to-depth: each 2×2 block of pixels becomes one
@@ -50,12 +50,12 @@ Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
 
 | Metric | Value |
 |---|---|
-| Standard cells | 18,659 combinational + 1,678 flip-flops |
-| Logic area | 142,011 µm² (0.142 mm²), 32% of it sequential |
+| Standard cells | 19,836 combinational + 1,521 flip-flops |
+| Logic area | 141,917 µm² (0.142 mm²), 27% of it sequential |
 | Longest combinational path | 2.6 ns → roughly 380 MHz |
 | Time per inference at that clock | CNN ≈ 30 µs, MLP ≈ 17 µs |
-| Memory as configured | 659 kbit: weights 524 kbit, 2 × 66 kbit activations, 4 kbit bias |
-| Memory the CNN alone needs | 102 kbit: weights 66 kbit, 2 × 16 kbit activations, 4 kbit bias |
+| Memory as configured | 664 kbit: weights 524 kbit, 2 × 66 kbit activations, 7 kbit parameters, 1 kbit layer table |
+| Memory the CNN alone needs | 107 kbit: weights 66 kbit, 2 × 16 kbit activations, 7 kbit parameters, 1 kbit layer table |
 
 These are logic-synthesis estimates, not sign-off numbers: there is no
 placement, routing, clock tree or SRAM macro yet (SRAM access time may well
@@ -76,7 +76,8 @@ comparable.
 | 2. 3-stage MAC pipeline, multi-cycle requantization | 3.1 ns | 87,594 µm² | 7,389 | n/a |
 | 3. Convolution (window addressing, wider layer table) | 3.0 ns | 102,592 µm² | 7,389 | 47,072 |
 | 4. Post unit overlaps the next output | 3.0 ns | 108,403 µm² | 6,460 | 20,051 |
-| 5. Current: feed-forward post pipeline, back-to-back outputs | 2.6 ns | 142,011 µm² | 6,377 | 11,352 |
+| 5. Feed-forward post pipeline, back-to-back outputs | 2.6 ns | 142,011 µm² | 6,377 | 11,352 |
+| 6. Current: padding, max pooling, per-channel requantization | 2.6 ns | 141,917 µm² | 6,379 | 11,355 |
 
 What each step changed in the RTL:
 
@@ -95,6 +96,12 @@ What each step changed in the RTL:
   outputs are registered before the multipliers. The CNN's drop from 20,051
   cycles also needs the space-to-depth input, which is a model change: with
   the old network this hardware takes 18,112.
+
+- **6**: out-of-image words are zeroed as they are read (padding); a lane-wise
+  maximum path writes pooled words directly; bias, multiplier and shift come
+  from one parameter word per output channel and travel with the output. The
+  layer table moves from registers to a small memory and grows to 8 entries,
+  which is why the logic area does not rise.
 
 Step 5 trades area for speed: 31% more logic for a 13% shorter clock period
 and, on the CNN, 43% fewer cycles.
@@ -118,10 +125,10 @@ It builds with the open-source flow (Yosys, nextpnr-himbaechel, gowin_pack):
 
 | Metric | Value |
 |---|---|
-| Timing | 98 MHz achievable, 27 MHz required (board oscillator) |
-| LUT4 | 2,823 of 20,736 (13%) |
-| Flip-flops | 1,655 of 15,552 (10%) |
-| Block RAM | 14 of 46 (30%) |
+| Timing | 88 MHz achievable, 27 MHz required (board oscillator) |
+| LUT4 | 2,780 of 20,736 (13%) |
+| Flip-flops | 2,163 of 15,552 (14%) |
+| Block RAM | 17 of 46 (37%) |
 | DSP multipliers | 8 × 9×9 and 4 × 18×18 |
 
 What has and has not been checked:
@@ -164,7 +171,7 @@ flowchart LR
 
     subgraph mem[Memories]
         wmem[(Weights<br/>8192 × 64 bit)]
-        bmem[(Bias<br/>128 × 32 bit)]
+        bmem[(Parameters<br/>128 × 54 bit)]
         bufa[(Activation<br/>buffer A<br/>1024 × 64 bit)]
         bufb[(Activation<br/>buffer B<br/>1024 × 64 bit)]
     end
@@ -194,33 +201,46 @@ flowchart LR
     bufa -- 8 activations per cycle --> reg0
     bufb -- 8 activations per cycle --> reg0
     bmem -- bias as initial value --> acc
+    bmem -- M and S per channel --> hmul
+    reg0 -- pooling, lane-wise max --> bufb
     acc -- hidden layer --> hmul
     clamp -- int8 outputs --> bufb
     clamp -- int8 outputs --> bufa
     acc -- last layer --> out
     ctrl -. addresses and sequencing .-> mem
     ctrl -. control .-> mac
-    ctrl -. M and S .-> rq
+    ctrl -. zero out-of-image words .-> reg0
 ```
 
 The two activation buffers ping-pong: even layers read A and write B, odd
 layers read B and write A.
 
-### How convolution works here
+### How layers are executed
 
 There is no separate convolution engine. Feature maps are stored HWC with the
 channel count padded to a multiple of 8, so one pixel is a whole number of
-64-bit words and each kernel row of a window is a contiguous run of words.
-An output value is then the same dot product as before, read through a
-pointer that walks `row_len` words, skips `row_skip` words to the next image
-row, and repeats for `n_rows` rows. The window origin advances by `step_x`
+64-bit words. A window is `kh` rows of `kw` pixels; the read pointer visits
+`rd_words` words of each pixel, then moves `pix_step` to the next pixel or
+`row_step` to the next kernel row. The window origin advances by `step_x`
 words per output column and `step_y` per output row, which is how stride is
-expressed. A fully-connected layer is the special case of one output pixel
-whose single kernel row covers the whole input.
+expressed.
 
-Limits: no padding (valid convolutions only), no pooling (use stride),
-convolution output channels must be a multiple of 8, and one requantization
-scale per layer rather than per channel.
+- **Convolution** reads every word of each window pixel and feeds the
+  multiply-accumulate pipeline.
+- **Fully connected** is the special case of one output pixel whose single
+  "pixel" is the whole input.
+- **Padding** is not stored. The window origin starts outside the image, and
+  any word whose pixel lies outside the image is replaced by zero as it is
+  read.
+- **Max pooling** bypasses the multipliers. Channels are packed eight to a
+  word, so the maximum is taken on whole words, eight lanes at a time, and the
+  result is written back directly.
+- **Requantization** uses a multiplier and shift per output channel, stored
+  next to the bias. The last layer keeps one scale for all outputs, because
+  its raw sums are compared with each other.
+
+Limits: convolution output channels must be a multiple of 8, pooling is max
+only, and a network has at most 8 layers.
 
 ### Files
 
