@@ -6,8 +6,14 @@
 //     hidden layer: y = clamp((acc * M + 2^(S-1)) >>> S, 0, 127)  -> next buffer
 //     last layer  : raw acc streamed out as a logit, argmax tracked
 //
-// The network is described by a small layer table ("program") in cfg memory;
-// each 80-bit entry is:
+// Timing: the MAC loop is a 3-stage pipeline (multiply, adder tree,
+// accumulate). Requantisation runs once per neuron, so it is spread over
+// several cycles with one small 9x17 multiplier (acc is consumed a byte at a
+// time, MSB first) instead of a single wide multiply-shift-clamp path.
+//
+// The network is described by a small layer table (the "program"), held in
+// registers that the host writes through the cfg_* port while the core is
+// idle. Each 80-bit entry is:
 //     [11:0]  in_words   input length in P-byte words
 //     [23:12] out_size   number of output neurons
 //     [43:24] w_base     first weight word of the layer
@@ -25,11 +31,15 @@ module nn_accel #(
     parameter int B_AW       = 7,    // bias memory address bits
     parameter int MAX_LAYERS = 4,
     parameter     W_FILE     = "",
-    parameter     B_FILE     = "",
-    parameter     CFG_FILE   = ""
+    parameter     B_FILE     = ""
 ) (
     input  logic                clk,
     input  logic                rst_n,
+
+    // host: program the layer table (only while idle)
+    input  logic                cfg_we,
+    input  logic [$clog2(MAX_LAYERS)-1:0] cfg_addr,
+    input  logic [79:0]         cfg_data,
 
     // host: load input activations into buffer A (only while idle)
     input  logic                in_we,
@@ -51,36 +61,32 @@ module nn_accel #(
     localparam int LP = $clog2(P);
 
     typedef enum logic [3:0] {
-        S_IDLE, S_LAYER, S_NEURON, S_MAC, S_DRAIN,
-        S_BIAS, S_MUL, S_RND, S_OUT, S_NEXT, S_DONE
+        S_IDLE, S_LOAD, S_LAYER, S_NEURON, S_MAC, S_DRAIN, S_BIAS,
+        S_MUL, S_MULF, S_RADD, S_SHIFT, S_CLAMP, S_OUT, S_NEXT, S_DONE
     } state_t;
     state_t state;
 
     // ---------------------------------------------------------------- config
     logic [79:0] cfg_mem [0:MAX_LAYERS-1];
-    initial if (CFG_FILE != "") $readmemh(CFG_FILE, cfg_mem);
+    always_ff @(posedge clk) if (cfg_we) cfg_mem[cfg_addr] <= cfg_data;
 
     logic [2:0]  layer;
     logic [79:0] cfg;
     assign cfg = cfg_mem[layer[$clog2(MAX_LAYERS)-1:0]];
 
-    logic [11:0] c_in_words, c_out_size, c_b_base;
+    // fields of the current layer, latched in S_LOAD
+    logic [11:0] c_in_last, c_out_last, c_b_base;   // *_last = size - 1
     logic [19:0] c_w_base;
     logic [15:0] c_mult;
     logic [5:0]  c_shift;
     logic        c_last;
-    assign c_in_words = cfg[11:0];
-    assign c_out_size = cfg[23:12];
-    assign c_w_base   = cfg[43:24];
-    assign c_b_base   = cfg[55:44];
-    assign c_mult     = cfg[71:56];
-    assign c_shift    = cfg[77:72];
-    assign c_last     = cfg[78];
+    logic signed [47:0] c_round;   // 2^(shift-1), decoded once per layer
 
     // -------------------------------------------------------------- counters
     logic [11:0]     neuron;   // output neuron index within the layer
     logic [11:0]     widx;     // input word index within the neuron
     logic [W_AW-1:0] w_ptr;    // running weight address
+    logic [B_AW-1:0] b_ptr;    // running bias address
     logic            src_sel;  // 0: read A / write B,  1: read B / write A
     assign src_sel = layer[0];
 
@@ -95,7 +101,7 @@ module nn_accel #(
         .clk, .we(1'b0), .addr(w_ptr), .wdata('0), .rdata(w_q));
 
     sram_sp #(.DW(32), .AW(B_AW), .FILE(B_FILE)) u_bmem (
-        .clk, .we(1'b0), .addr(B_AW'(c_b_base + neuron)), .wdata('0), .rdata(b_q));
+        .clk, .we(1'b0), .addr(b_ptr), .wdata('0), .rdata(b_q));
 
     logic            bufa_we, bufb_we;
     logic [A_AW-1:0] bufa_addr, bufb_addr;
@@ -114,18 +120,35 @@ module nn_accel #(
 
     // ------------------------------------------------------------- MAC pipe
     //   cycle n   : address issued (state == S_MAC)
-    //   cycle n+1 : memory data valid, P products summed        (v1)
-    //   cycle n+2 : partial sum added into the accumulator       (v2)
+    //   cycle n+1 : memory data valid, P products registered     (v1)
+    //   cycle n+2 : adder tree over the products, registered      (v2)
+    //   cycle n+3 : partial sum added into the accumulator        (v3)
     logic signed [15+LP:0] dot, dot_r;
-    logic                  v1, v2;
+    logic                  v1, v2, v3;
     logic signed [31:0]    acc;
 
-    dot_unit #(.P(P)) u_dot (.w(w_q), .x(a_q), .sum(dot));
+    // one shared 32-bit adder: MAC accumulation or bias add
+    logic signed [31:0] acc_y;
+    assign acc_y = acc + ((state == S_BIAS) ? $signed(b_q) : 32'(dot_r));
+
+    dot_unit #(.P(P)) u_dot (.clk, .en(v1), .w(w_q), .x(a_q), .sum(dot));
 
     // ------------------------------------------------------------- requant
-    logic signed [47:0] prod, rnd;
+    // prod = acc * M by Horner's rule over the four bytes of acc, MSB first:
+    //   prod = ((b3*M * 256 + b2*M) * 256 + b1*M) * 256 + b0*M
+    // acc doubles as the shift register that feeds the bytes out.
+    logic signed [8:0]  chunk;   // top byte of acc; signed only for b3
+    logic signed [25:0] pp;      // chunk * M
+    logic signed [47:0] prod;
+    logic [1:0]         mcnt;
     logic [7:0]         q;
-    assign rnd = (prod + (48'sd1 <<< (c_shift - 6'd1))) >>> c_shift;
+    assign chunk = {(mcnt == 2'd0) & acc[31], acc[31:24]};
+
+    // one shared 48-bit adder: Horner step (prod*256 + pp) or rounding add
+    logic signed [47:0] add_a, add_b, add_y;
+    assign add_a = (state == S_RADD) ? prod    : (prod <<< 8);
+    assign add_b = (state == S_RADD) ? c_round : 48'(pp);
+    assign add_y = add_a + add_b;
 
     // output word assembly: collect P bytes, then one full-word write
     logic [P*8-1:0] out_word, out_word_n;
@@ -134,7 +157,7 @@ module nn_accel #(
         for (int k = 0; k < P; k++)
             out_word_n[k*8 +: 8] = (neuron[LP-1:0] == LP'(k)) ? q : out_word[k*8 +: 8];
     end
-    assign word_full = (neuron[LP-1:0] == LP'(P-1)) || (neuron == c_out_size - 12'd1);
+    assign word_full = (neuron[LP-1:0] == LP'(P-1)) || (neuron == c_out_last);
     assign dst_we    = (state == S_OUT) && !c_last && word_full;
     assign dst_addr  = neuron[LP +: A_AW];
     assign dst_data  = out_word_n;
@@ -148,11 +171,23 @@ module nn_accel #(
             neuron      <= '0;
             widx        <= '0;
             w_ptr       <= '0;
+            b_ptr       <= '0;
+            c_in_last   <= '0;
+            c_out_last  <= '0;
+            c_w_base    <= '0;
+            c_b_base    <= '0;
+            c_mult      <= '0;
+            c_shift     <= '0;
+            c_last      <= 1'b0;
+            c_round     <= '0;
             v1          <= 1'b0;
             v2          <= 1'b0;
+            v3          <= 1'b0;
             dot_r       <= '0;
             acc         <= '0;
+            pp          <= '0;
             prod        <= '0;
+            mcnt        <= '0;
             q           <= '0;
             out_word    <= '0;
             best        <= '0;
@@ -168,20 +203,34 @@ module nn_accel #(
 
             v1 <= (state == S_MAC);
             v2 <= v1;
-            if (v1) dot_r <= dot;
-            if (v2) acc   <= acc + 32'(dot_r);
+            v3 <= v2;
+            if (v2) dot_r <= dot;
+            if (v3) acc   <= acc_y;
 
             case (state)
                 S_IDLE: if (start) begin
                     layer <= '0;
                     busy  <= 1'b1;
-                    state <= S_LAYER;
+                    state <= S_LOAD;
+                end
+
+                S_LOAD: begin
+                    c_in_last  <= cfg[11:0]  - 12'd1;
+                    c_out_last <= cfg[23:12] - 12'd1;
+                    c_w_base   <= cfg[43:24];
+                    c_b_base   <= cfg[55:44];
+                    c_mult     <= cfg[71:56];
+                    c_shift    <= cfg[77:72];
+                    c_last     <= cfg[78];
+                    state      <= S_LAYER;
                 end
 
                 S_LAYER: begin
                     w_ptr    <= c_w_base[W_AW-1:0];
+                    b_ptr    <= c_b_base[B_AW-1:0];
                     neuron   <= '0;
                     out_word <= '0;
+                    c_round  <= 48'sd1 <<< (c_shift - 6'd1);
                     state    <= S_NEURON;
                 end
 
@@ -194,24 +243,44 @@ module nn_accel #(
                 S_MAC: begin
                     w_ptr <= w_ptr + 1'b1;
                     widx  <= widx + 12'd1;
-                    if (widx == c_in_words - 12'd1) state <= S_DRAIN;
+                    if (widx == c_in_last) state <= S_DRAIN;
                 end
 
-                S_DRAIN: if (!v1 && !v2) state <= S_BIAS;
+                S_DRAIN: if (!v1 && !v2 && !v3) state <= S_BIAS;
 
                 S_BIAS: begin
-                    acc   <= acc + $signed(b_q);
+                    acc  <= acc_y;
+                    mcnt <= '0;
                     if (c_last) state <= S_OUT;
                     else        state <= S_MUL;
                 end
 
                 S_MUL: begin
-                    prod  <= acc * $signed({1'b0, c_mult});
-                    state <= S_RND;
+                    pp   <= chunk * $signed({1'b0, c_mult});
+                    acc  <= {acc[23:0], 8'h00};
+                    prod <= (mcnt == 2'd0) ? '0 : add_y;
+                    mcnt <= mcnt + 2'd1;
+                    if (mcnt == 2'd3) state <= S_MULF;
                 end
 
-                S_RND: begin
-                    q     <= (rnd < 0) ? 8'd0 : (rnd > 127) ? 8'd127 : rnd[7:0];
+                S_MULF: begin
+                    prod  <= add_y;
+                    state <= S_RADD;
+                end
+
+                S_RADD: begin
+                    prod  <= add_y;
+                    state <= S_SHIFT;
+                end
+
+                S_SHIFT: begin
+                    prod  <= prod >>> c_shift;
+                    state <= S_CLAMP;
+                end
+
+                S_CLAMP: begin
+                    // negative -> 0; any bit above bit 6 set -> saturate at 127
+                    q     <= prod[47] ? 8'd0 : (|prod[46:7]) ? 8'd127 : prod[7:0];
                     state <= S_OUT;
                 end
 
@@ -227,10 +296,11 @@ module nn_accel #(
                     end else begin
                         out_word <= word_full ? '0 : out_word_n;
                     end
-                    if (neuron == c_out_size - 12'd1) begin
+                    if (neuron == c_out_last) begin
                         state <= S_NEXT;
                     end else begin
                         neuron <= neuron + 12'd1;
+                        b_ptr  <= b_ptr + 1'b1;
                         state  <= S_NEURON;
                     end
                 end
@@ -240,7 +310,7 @@ module nn_accel #(
                         state <= S_DONE;
                     end else begin
                         layer <= layer + 3'd1;
-                        state <= S_LAYER;
+                        state <= S_LOAD;
                     end
                 end
 

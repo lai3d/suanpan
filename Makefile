@@ -6,7 +6,7 @@ N    ?= 100
 # override VOBJ if this checkout lives under one.
 VOBJ ?= build/obj
 
-.PHONY: model sim sim-full wave lint clean
+.PHONY: model sim sim-full wave lint synth clean
 
 # Train + quantize the network, export memory images and golden vectors.
 model build/mem/weights.hex:
@@ -31,6 +31,11 @@ wave: build/mem/weights.hex
 
 lint:
 	verilator --lint-only -Wall -Wno-UNUSEDSIGNAL --top-module nn_accel $(RTL)
+
+# Logic synthesis onto SKY130 (needs yosys); PERIOD is the target in ps.
+PERIOD ?= 10000
+synth:
+	syn/synth.sh $(PERIOD)
 
 clean:
 	rm -rf build

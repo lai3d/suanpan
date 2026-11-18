@@ -1,0 +1,9 @@
+# Delay-oriented ABC mapping script ({D} expands to "-D <period>").
+strash
+balance
+map {D}
+topo
+buffer
+upsize {D}
+dnsize {D}
+stime -p
