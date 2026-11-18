@@ -64,6 +64,14 @@ jobs:
           make sim-full PY=python ARCH=mlp
           make sim-full PY=python ARCH=stress
 
+      - name: Compiler tests (ONNX import, rewrites, round trip)
+        run: make test-compiler PY=python
+
+      - name: PyTorch LeNet-5 from ONNX, 300 images (Verilator)
+        run: |
+          make lenet5 PY=python
+          make sim-full PY=python MEM=build/lenet5 N_FULL=300
+
       - name: Synthesize (SKY130)
         run: make synth
 

@@ -4,16 +4,20 @@ TB   := tb/tb_nn_accel.sv
 N    ?= 100
 # Network to build and simulate: cnn (default) or mlp.
 ARCH ?= cnn
-MEM  := build/$(ARCH)
+# Directory with the memory images. Override to run a network produced by
+# tools/compile.py, e.g. `make sim MEM=build/lenet5`.
+MEM  ?= build/$(ARCH)
+# Images for sim-full.
+N_FULL ?= 10000
 # Verilator's generated makefile cannot build in a path containing spaces;
 # override VOBJ if this checkout lives under one.
 VOBJ ?= build/obj
 
-.PHONY: model sim sim-full wave lint synth fpga fpga-sim fpga-gatesim fpga-load fpga-flash clean
+.PHONY: model sim sim-full wave lint synth test-compiler lenet5 fpga fpga-sim fpga-gatesim fpga-load fpga-flash clean
 
 # Train + quantize the network, export memory images and golden vectors.
 model $(MEM)/weights.hex:
-	$(PY) model/train.py --arch $(ARCH)
+	$(PY) model/train.py --arch $(ARCH) --onnx build/$(ARCH)/model.onnx
 
 # Quick check with Icarus Verilog (N images, default 100).
 sim: $(MEM)/weights.hex
@@ -26,7 +30,7 @@ sim-full: $(MEM)/weights.hex
 	verilator --binary --timing -Wno-fatal -O3 --Mdir $(VOBJ) \
 	    --top-module tb_nn_accel -o tb $(RTL) $(TB) > build/verilator.log 2>&1 \
 	    || (cat build/verilator.log; exit 1)
-	$(VOBJ)/tb +MEM=$(MEM) +N=10000 | tee build/sim-full.log
+	$(VOBJ)/tb +MEM=$(MEM) +N=$(N_FULL) | tee build/sim-full.log
 	@grep -q "RESULT: PASS" build/sim-full.log
 
 # Dump a waveform for one image -> build/tb.vcd
@@ -41,6 +45,16 @@ lint:
 PERIOD ?= 10000
 synth:
 	syn/synth.sh $(PERIOD)
+
+# Compiler tests: ONNX import, rewrites, error messages, and a byte-exact
+# round trip through ONNX for cnn, mlp and stress (run `make model` for each
+# of them first).
+test-compiler:
+	$(PY) tests/test_compiler.py
+
+# Compile the PyTorch LeNet-5 in examples/ -> build/lenet5
+lenet5:
+	$(PY) tools/compile.py examples/lenet5.onnx --out build/lenet5 --data mnist
 
 # --- Tang Nano 20K demo (needs the OSS CAD Suite on PATH) -----------------
 FPGA_TOP := fpga/uart.sv fpga/tangnano20k/top.sv

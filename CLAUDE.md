@@ -17,6 +17,8 @@ make sim-full   # all 10,000 test images under Verilator
 make wave       # one image, dumps build/tb.vcd
 make lint       # verilator --lint-only -Wall on the RTL
 make synth      # Yosys + ABC onto SKY130, PERIOD=<ps>
+make test-compiler   # compiler tests incl. byte-exact ONNX round trip
+make lenet5          # compile examples/lenet5.onnx -> build/lenet5
 
 make fpga-sim      # Tang Nano 20K wrapper in RTL simulation
 make fpga          # synth_gowin + nextpnr-himbaechel + gowin_pack -> build/fpga/top.fs
@@ -26,7 +28,9 @@ make fpga-load     # openFPGALoader, SRAM (volatile); fpga-flash writes flash
 
 The `fpga` targets need the OSS CAD Suite on `PATH` (Homebrew has no `nextpnr-himbaechel`). Vendor tools are not an option on macOS.
 
-- `ARCH=cnn` (default), `ARCH=mlp` or `ARCH=stress` selects the network for `model`, `sim`, `sim-full` and `wave`. Each has its own `build/<arch>/` directory.
+- `ARCH=cnn` (default), `ARCH=mlp` or `ARCH=stress` selects the network for `model`, `sim`, `sim-full` and `wave`. Each has its own `build/<arch>/` directory. `MEM=<dir>` points the simulation at any compiled network instead, e.g. `make sim-full MEM=build/lenet5 N_FULL=300`.
+- `make test-compiler` needs `make model` to have been run for `cnn`, `mlp` and `stress`, because it round-trips their ONNX files.
+- `examples/lenet5.onnx` is committed. Regenerating it needs PyTorch, which is not in the project environment: `uv run --python 3.13 --with torch --with onnx examples/train_lenet5.py`.
 - The quickest check after an RTL change is `make sim N=5`. Before finishing, run `make lint` and `make sim-full` for `ARCH=cnn`, `ARCH=mlp` and `ARCH=stress`; CI runs all three. The MLP exercises the fully-connected path as a degenerate convolution. `stress` is not a useful network: it exists to hit hardware corner cases (padded convolutions at stride 1 and 2, max pooling over one-word and two-word pixels, a hidden layer with one-word windows so outputs complete on consecutive cycles, a single-channel input padded to 8, and a layer width that is not a multiple of 8). If you add a corner case to the RTL, extend `stress` to reach it.
 - `sim` and `sim-full` exit non-zero unless the testbench prints `RESULT: PASS`.
 - Verilator's generated makefile cannot build in a path containing spaces. If the checkout lives under one, pass `VOBJ=<dir without spaces>` to `make sim-full`.
@@ -34,7 +38,7 @@ The `fpga` targets need the OSS CAD Suite on `PATH` (Homebrew has no `nextpnr-hi
 
 ## The one invariant
 
-`model/train.py` contains an integer-only reference (`int_layer` / `golden`) that must match the RTL datapath **bit for bit**. The testbench compares every logit, not just the predicted class. Any change to arithmetic in `rtl/nn_accel.sv` (rounding, saturation, widths, operand order) needs the same change in `int_layer`, and vice versa. The shared definition is:
+`model/nnc.py` contains an integer-only reference (`int_layer` / `golden`) that must match the RTL datapath **bit for bit**. The testbench compares every logit, not just the predicted class. Any change to arithmetic in `rtl/nn_accel.sv` (rounding, saturation, widths, operand order) needs the same change in `int_layer`, and vice versa. The shared definition is:
 
 ```
 acc = sum(w_int8 * x_int8) + bias_int32
@@ -44,11 +48,11 @@ last layer:   logits = raw acc, class = argmax
 
 ## Architecture
 
-The hardware is network-agnostic. A network is three memory images produced by `train.py` (weights, biases, layer table) plus a `meta.hex` the testbench reads; the RTL has no knowledge of MNIST or of a particular topology.
+The hardware is network-agnostic. A network is three memory images produced by the compiler (weights, parameters, layer table) plus a `meta.hex` the testbench reads; the RTL has no knowledge of MNIST or of a particular topology.
 
 **One address walker for every layer type.** There is no convolution engine. Activations are stored HWC with the channel count zero-padded to a multiple of `P=8`, so one pixel is a whole number of 64-bit words and each kernel row of a window is a contiguous run of words. A window is `kh` rows of `kw` pixels; the pointer reads `rd_words` words of each pixel, then steps `pix_step` to the next pixel or `row_step` to the next kernel row. The window origin moves by `step_x` / `step_y` words, which is how stride is expressed. A fully-connected layer is one output pixel whose single "pixel" is the whole input. Padding is never stored: the origin starts at a negative address (`org`, two's complement, pointer arithmetic wraps) and a pair of image-coordinate counters (`ix_cur`, `iy_cur`) flag words that lie outside the image so stage 0 can zero them. Max pooling reuses the same walk but reads one word per pixel, takes a lane-wise maximum at stage 1, and writes whole words, bypassing the multipliers and the post pipeline.
 
-**The layer table is the contract between Python and RTL.** Each layer is one 176-bit descriptor. Its bit layout is defined twice and must stay in sync: `CFG_FIELDS` in `model/train.py` and the header comment plus the `S_LOAD` state in `rtl/nn_accel.sv`. `compile_program()` in `train.py` is where a layer's geometry is turned into those fields and where weights are packed in the order the hardware reads them (per output channel: `ky`, `kx`, padded channel). The other contract is the 54-bit parameter word, one per output channel (`params.hex`): bias, multiplier M, shift S. Widths appear in the testbench and the FPGA wrapper too (`cfg_data`, `cfg_rom`), so a change to either format touches four files.
+**The layer table is the contract between Python and RTL.** Each layer is one 176-bit descriptor. Its bit layout is defined twice and must stay in sync: `CFG_FIELDS` in `model/nnc.py` and the header comment plus the `S_LOAD` state in `rtl/nn_accel.sv`. `compile_program()` in `nnc.py` is where a layer's geometry is turned into those fields and where weights are packed in the order the hardware reads them (per output channel: `ky`, `kx`, padded channel). The other contract is the 54-bit parameter word, one per output channel (`params.hex`): bias, multiplier M, shift S. Widths appear in the testbench and the FPGA wrapper too (`cfg_data`, `cfg_rom`), so a change to either format touches four files.
 
 **Control flow in `nn_accel.sv`.** Only address generation is a state machine; everything after it is a feed-forward pipeline. The front end (`state`) issues one memory word per cycle in `S_MAC` and, on the last word of an output, moves the channel / pixel / row counters on so that the next output's first word follows in the very next cycle. Words flow through four stages (`v0`..`v3`: registered operands, registered products, adder tree, accumulate) carrying tags: `f` first word of an output, `l` last word, `e` last word of the layer. The accumulator starts from the bias on the first word. When a last word reaches stage 3 (`handoff`) the sum enters the post pipeline (`pv[0..6]`): four 9x17 multiplies, two combine stages, round, shift, clamp, write. Output bytes are assembled into a full word before being written. Two activation buffers ping-pong, selected by `layer[0]`.
 
@@ -58,7 +62,11 @@ Things that follow from this design:
 - `b_q` holds an output's parameter word for only one cycle when windows are one word long, which is why it is captured at stage 0 and carried along (`par_r0..2`), and why M and S continue down the post pipeline with the data (`p0_m`, `p*_s`) instead of being per-layer constants.
 - The front end drains everything in flight (`S_DRAIN`) before changing layer, because the next layer reads the buffer the current one is still writing and `c_pool` and `c_last` are per-layer constants.
 
-**Input layout is part of the model.** The default CNN stores its input space-to-depth (`"s2d": 2` in `ARCHS`, see `prep()` in `train.py`): 2x2 pixel blocks become 4-channel pixels. It is a pure rearrangement done by the exporter; the hardware does not know about it. Anything that feeds images to the accelerator (the testbench's `images.hex`, the FPGA demo ROM) must use the same layout.
+**The compiler has two front ends and one back end.** `model/train.py` (numpy training of the built-in networks) and `tools/compile.py` + `model/onnx_io.py` (ONNX import) both produce the same description (input shape, layer specs, float weights) and hand it to `model/nnc.py`, which owns the rewrites, quantization, the golden model, capacity checks and the export. A change to quantization or to a file format belongs in `nnc.py` only. The round-trip test (`train.py` -> ONNX -> `compile.py` must be byte-identical) is what keeps the two paths honest; if it fails after a change, one path was changed and the other was not.
+
+**Rewrites must preserve the function exactly.** `pad_conv_channels`, `rewrite_fc_input` and `rewrite_s2d` change layout, never results; `tests/test_compiler.py` checks each against the float model. Unsupported ONNX constructs raise `CompileError` with a reason. Do not add a fallback that compiles something approximately.
+
+**Input layout is part of the model.** The default CNN stores its input space-to-depth (`"s2d": 2` in `ARCHS`, or applied automatically by `rewrite_s2d` on the ONNX path): 2x2 pixel blocks become 4-channel pixels. It is a pure rearrangement done by the exporter; the hardware does not know about it. Anything that feeds images to the accelerator (the testbench's `images.hex`, the FPGA demo ROM) must use the same layout.
 
 **Memories are black boxes in synthesis.** `rtl/sram_sp.sv` is a behavioral synchronous-read memory standing in for SRAM macros. `syn/synth.sh` reads it with `-lib`, so reported area and timing cover logic only. The testbench loads weight and bias images by hierarchical reference (`dut.u_wmem.mem`).
 
@@ -70,7 +78,7 @@ Things that follow from this design:
 - **Icarus is the stricter front end.** It rejects enum assignment through a ternary (`state <= c ? A : B`) and warns on variable part-selects inside `always_comb`; use `if/else` and per-lane loops as the existing code does. Code must build under both Icarus and Verilator.
 - **Layer constraints.** Convolution output channels must be a multiple of 8 (`compile_program()` asserts it), pooling is max only, the last layer uses one requantization scale because its raw sums are compared, and the layer table holds 8 entries (`MAX_LAYERS`).
 - **Mutation-test new datapath logic.** The networks pass easily when a feature is simply not exercised. After adding logic, break it on purpose in a copy under `build/` (never by editing and reverting the working tree) and confirm `stress` fails.
-- **Buffer sizes are parameters.** `A_AW`, `W_AW`, `B_AW` in `nn_accel.sv` bound the largest feature map, weight count and bias count. The testbench has its own `A_AW` and `MAX_*` limits that must cover the network being run.
+- **Buffer sizes are parameters.** `A_AW`, `W_AW`, `B_AW` in `nn_accel.sv` bound the largest feature map, weight count and parameter count; `LIMITS` in `nnc.py` mirrors the defaults so the compiler can refuse networks that do not fit. The testbench has its own `A_AW` and `MAX_*` limits that must cover the network being run.
 
 ## FPGA flow
 

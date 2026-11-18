@@ -1,0 +1,409 @@
+"""suanpan network compiler: turns a float network into the accelerator's
+memory images.
+
+    float layers -> rewrites -> INT8 quantization -> layer table + memories
+                                      |
+                                      +-> integer golden model (bit-exact
+                                          reference for the RTL)
+
+A network is described by
+    input shape   (H, W, C)
+    specs         one tuple per layer:
+                    ("conv", k, stride, out_ch[, pad])   k is int or (kh, kw)
+                    ("pool", k, stride)                  max pooling
+                    ("fc", out)
+    fparams       per layer (W, b) or None for pooling, with W shaped
+                  (out_ch, kh*kw*C) in (ky, kx, c) order
+
+Hidden conv / fc layers are followed by ReLU; the last layer is not.
+
+Hardware arithmetic (must match rtl/nn_accel.sv exactly):
+    acc  = sum(w_int8 * x_int8) + bias_int32
+    hidden: y = clamp((acc * M + 2^(S-1)) >> S, 0, 127), M and S per channel
+    last  : logits = acc (raw int32), class = argmax
+    pool  : y = max over the window, per channel
+
+Memory layout: activations are stored HWC with the channel count padded to a
+multiple of P=8, so one pixel is a whole number of 64-bit words.
+"""
+from pathlib import Path
+
+import numpy as np
+
+P = 8  # MAC lanes == bytes per memory word
+
+# Capacity of the hardware as configured by default (see rtl/nn_accel.sv).
+LIMITS = dict(W_AW=13, A_AW=10, B_AW=8, MAX_LAYERS=8, MAX_OUT=16)
+
+
+class CompileError(Exception):
+    """The network cannot be mapped onto the accelerator."""
+
+
+# ------------------------------------------------------------------ geometry
+def geometry(input_shape, specs):
+    """Resolve every layer to kernel, stride, padding and in/out shapes."""
+    h, w, c = input_shape
+    out = []
+    for spec in specs:
+        kind = spec[0]
+        if kind == "fc":
+            kh, kw, s, p, oc = h, w, 1, 0, spec[1]
+        else:
+            k = spec[1]
+            kh, kw = k if isinstance(k, tuple) else (k, k)
+            if kind == "pool":
+                s, p, oc = spec[2], 0, c
+            else:
+                s, oc, p = spec[2], spec[3], (spec[4] if len(spec) > 4 else 0)
+        oh, ow = (h + 2 * p - kh) // s + 1, (w + 2 * p - kw) // s + 1
+        if oh < 1 or ow < 1:
+            raise CompileError(f"layer {len(out)}: {kh}x{kw} window does not fit "
+                               f"a {h}x{w} input")
+        out.append(dict(kind=kind, kh=kh, kw=kw, s=s, p=p, oc=oc,
+                        h=h, w=w, c=c, oh=oh, ow=ow))
+        h, w, c = oh, ow, oc
+    if out[-1]["kind"] == "pool":
+        raise CompileError("the last layer must produce logits, not a pooled map")
+    return out
+
+
+def im2col(x, g):
+    """(N,H,W,C) -> (N,OH,OW,kh*kw*C), patch order (ky, kx, c), zero padded."""
+    if g["p"]:
+        x = np.pad(x, ((0, 0), (g["p"], g["p"]), (g["p"], g["p"]), (0, 0)))
+    n, _, _, c = x.shape
+    cols = np.empty((n, g["oh"], g["ow"], g["kh"], g["kw"], c), x.dtype)
+    for ky in range(g["kh"]):
+        for kx in range(g["kw"]):
+            cols[:, :, :, ky, kx, :] = x[:, ky:ky + g["s"] * g["oh"]:g["s"],
+                                         kx:kx + g["s"] * g["ow"]:g["s"], :]
+    return cols.reshape(n, g["oh"], g["ow"], -1)
+
+
+def pool_windows(a, g):
+    """(N,H,W,C) -> (N,OH,OW,kh*kw,C): the values each pooled output sees."""
+    n = len(a)
+    return im2col(a, g).reshape(n, g["oh"], g["ow"], g["kh"] * g["kw"], g["c"])
+
+
+def float_forward(geo, fparams, a):
+    """Float reference: (N,H,W,C) inputs scaled to [0, 1] -> logits."""
+    for li, (g, fp) in enumerate(zip(geo, fparams)):
+        if g["kind"] == "pool":
+            a = pool_windows(a, g).max(3)
+        else:
+            z = im2col(a, g) @ fp[0].T + fp[1]
+            a = z if li == len(geo) - 1 else np.maximum(z, 0)
+    return a.reshape(len(a), -1)
+
+
+# ------------------------------------------------------------------ rewrites
+def s2d_input(x, b=2):
+    """Space-to-depth: (N,H,W,C) -> (N,H/b,W/b,b*b*C), channel (dy*b+dx)*C+c.
+    A pure rearrangement of the input."""
+    n, h, w, c = x.shape
+    x = x.reshape(n, h // b, b, w // b, b, c).transpose(0, 1, 3, 2, 4, 5)
+    return x.reshape(n, h // b, w // b, b * b * c)
+
+
+def s2d_weights(w, kh, kw, c, b=2):
+    """Kernel (oc, kh*kw*c) on the image -> (oc, kh/b*kw/b*b*b*c) on its
+    space-to-depth form. Same numbers, reordered."""
+    oc = len(w)
+    w = w.reshape(oc, kh // b, b, kw // b, b, c).transpose(0, 1, 3, 2, 4, 5)
+    return w.reshape(oc, -1)
+
+
+def s2d_weights_inv(w, kh, kw, c, b=2):
+    """Inverse of s2d_weights; kh, kw, c describe the kernel on the image."""
+    oc = len(w)
+    w = w.reshape(oc, kh // b, kw // b, b, b, c).transpose(0, 1, 3, 2, 4, 5)
+    return w.reshape(oc, -1)
+
+
+def rewrite_s2d(input_shape, specs, fparams):
+    """If the first layer is an even-sized stride-2 convolution on a narrow
+    input, store the input space-to-depth and halve the kernel. The arithmetic
+    is identical, but a kxk window becomes (k/2)x(k/2) memory words instead of
+    kxk. Returns (input_shape, specs, fparams, s2d) with s2d = 2 or None."""
+    h, w, c = input_shape
+    spec = specs[0]
+    if spec[0] != "conv":
+        return input_shape, specs, fparams, None
+    k = spec[1]
+    kh, kw = k if isinstance(k, tuple) else (k, k)
+    pad = spec[4] if len(spec) > 4 else 0
+    if not (spec[2] == 2 and pad == 0 and kh % 2 == 0 and kw % 2 == 0
+            and h % 2 == 0 and w % 2 == 0 and 4 * c <= P):
+        return input_shape, specs, fparams, None
+    new_spec = ("conv", (kh // 2, kw // 2), 1, spec[3])
+    new_w = s2d_weights(fparams[0][0], kh, kw, c)
+    return ((h // 2, w // 2, 4 * c), [new_spec] + list(specs[1:]),
+            [(new_w, fparams[0][1])] + list(fparams[1:]), 2)
+
+
+def rewrite_fc_input(input_shape, specs):
+    """A network that starts with a fully-connected layer reads its input as
+    one long pixel, so it is packed 8 values to a word instead of one."""
+    if specs[0][0] != "fc":
+        return input_shape, False
+    h, w, c = input_shape
+    return (1, 1, h * w * c), (h, w) != (1, 1)
+
+
+def pad_conv_channels(input_shape, specs, fparams):
+    """The hardware writes convolution outputs a whole word at a time, so
+    their channel count is rounded up to a multiple of 8 with all-zero
+    filters. The extra channels are always 0 and the next layer's weights for
+    them are 0, so results do not change."""
+    specs, fparams = list(specs), list(fparams)
+    extra = 0                      # zero channels added to the current tensor
+    c = input_shape[2]
+    for li, spec in enumerate(specs):
+        if spec[0] == "pool":
+            continue
+        w, b = fparams[li]
+        if extra:                  # widen this layer's input to match
+            oc = len(w)
+            w = w.reshape(oc, -1, c - extra)
+            w = np.concatenate([w, np.zeros((oc, w.shape[1], extra), w.dtype)], 2)
+            w = w.reshape(oc, -1)
+            extra = 0
+        oc = spec[1] if spec[0] == "fc" else spec[3]
+        last = li == len(specs) - 1
+        if spec[0] == "conv" and not last and oc % P:
+            extra = (-oc) % P
+            w = np.concatenate([w, np.zeros((extra, w.shape[1]), w.dtype)])
+            b = np.concatenate([b, np.zeros(extra, b.dtype)])
+            spec = spec[:3] + (oc + extra,) + spec[4:]
+        specs[li], fparams[li] = spec, (w, b)
+        c = (spec[1] if spec[0] == "fc" else spec[3])
+    return specs, fparams
+
+
+# -------------------------------------------------------------- quantization
+def int_layer(a, g, q, last):
+    """One layer of the integer reference model."""
+    if g["kind"] == "pool":
+        return pool_windows(a, g).max(3)
+    acc = im2col(a, g) @ q["w"].T + q["b"]
+    if np.abs(acc).max() >= 2**31:
+        raise CompileError("accumulator overflows 32 bits")
+    if last:
+        return acc
+    return np.clip((acc * q["M"] + np.left_shift(1, q["S"] - 1)) >> q["S"], 0, 127)
+
+
+def requant_factor(f):
+    """Scalar f ~= M / 2^S with M in [2^14, 2^15] and 1 <= S <= 40."""
+    s = 1
+    while f * (1 << s) < (1 << 14) and s < 40:
+        s += 1
+    m = int(round(f * (1 << s)))
+    assert 0 <= m < (1 << 16)
+    return m, s
+
+
+def quantize(geo, fparams, calib_a):
+    """Post-training quantization, calibrated layer by layer on integer
+    activations so the scales match what the hardware will actually see.
+    `calib_a` is (N,H,W,C) int, 0..127. Hidden layers get one weight scale per
+    output channel. The last layer keeps a single scale, because its raw sums
+    are compared with each other."""
+    a = calib_a.astype(np.int64)
+    s_in = 1 / 127.0
+    qparams = []
+    for li, (g, fp) in enumerate(zip(geo, fparams)):
+        last = li == len(geo) - 1
+        if g["kind"] == "pool":
+            qparams.append(None)
+            a = int_layer(a, g, None, False)
+            continue
+        w, b = fp
+        oc = g["oc"]
+        if last:
+            s_w = np.full(oc, np.abs(w).max() / 127)
+        else:
+            s_w = np.maximum(np.abs(w).max(1), 1e-12) / 127
+        q = dict(w=np.round(w / s_w[:, None]).astype(np.int64),
+                 b=np.round(b / (s_w * s_in)).astype(np.int64),
+                 M=np.zeros(oc, np.int64), S=np.ones(oc, np.int64))
+        if not last:
+            acc = im2col(a, g) @ q["w"].T + q["b"]
+            s_out = np.percentile(np.maximum(acc, 0) * (s_w * s_in), 99.9) / 127
+            if s_out <= 0:
+                raise CompileError(f"layer {li}: every activation is zero on the "
+                                   "calibration data")
+            for c in range(oc):
+                q["M"][c], q["S"][c] = requant_factor(s_w[c] * s_in / s_out)
+            a = int_layer(a, g, q, False)
+            s_in = s_out
+        qparams.append(q)
+    return qparams
+
+
+def golden(geo, qparams, a):
+    """Integer-only reference; mirrors the RTL datapath bit for bit."""
+    a = a.astype(np.int64)
+    for li, (g, q) in enumerate(zip(geo, qparams)):
+        a = int_layer(a, g, q, li == len(geo) - 1)
+    logits = a.reshape(len(a), -1)
+    return logits, logits.argmax(1)
+
+
+# -------------------------------------------------------------------- export
+def pad_c(a):
+    """Zero-pad the last (channel) axis to a multiple of P."""
+    pad = (-a.shape[-1]) % P
+    return np.pad(a, [(0, 0)] * (a.ndim - 1) + [(0, pad)])
+
+
+def pack_words(a):
+    """int array (rows, n) with n % P == 0 -> flat list of 64-bit words."""
+    a = (a.astype(np.int64) & 0xFF).reshape(-1, P).astype(np.uint64)
+    shifts = np.arange(P, dtype=np.uint64) * np.uint64(8)
+    return (a << shifts).sum(-1, dtype=np.uint64)
+
+
+def write_hex(path, values, digits):
+    with open(path, "w") as f:
+        for v in values:
+            f.write(f"{int(v) & ((1 << (4 * digits)) - 1):0{digits}x}\n")
+
+
+# Layer descriptor, LSB first. Keep in sync with rtl/nn_accel.sv.
+CFG_FIELDS = [("kw", 4), ("kh", 4), ("rd_words", 12), ("pix_step", 12),
+              ("row_step", 12), ("step_x", 12), ("step_y", 16), ("org", 16),
+              ("in_w", 8), ("in_h", 8), ("pad", 4), ("stride", 4),
+              ("out_w", 8), ("out_h", 8), ("out_ch", 12), ("w_base", 20),
+              ("b_base", 12), ("pool", 1), ("last", 1)]
+CFG_BITS = 176
+
+
+def cfg_word(layer, **fields):
+    word, pos = 0, 0
+    for name, width in CFG_FIELDS:
+        value = fields.pop(name)
+        if not 0 <= value < (1 << width):
+            raise CompileError(f"layer {layer}: {name} = {value} does not fit "
+                               f"in {width} bits")
+        word |= value << pos
+        pos += width
+    assert not fields and pos <= CFG_BITS
+    return word
+
+
+def compile_program(geo, qparams):
+    """Turn the network into the accelerator's memory images.
+
+    The read pointer visits `rd_words` words of each window pixel, then moves
+    `pix_step` to the next pixel, or `row_step` to the next kernel row. A
+    convolution reads every word of a pixel; pooling reads one word per pixel
+    and is repeated for each word of the output pixel. `org` is the address of
+    the first window's first word, which is negative (two's complement) when
+    the layer is padded; out-of-image words are zeroed by the hardware."""
+    weights, params, cfg = [], [], []
+    n_w = n_p = 0
+    for li, (g, q) in enumerate(zip(geo, qparams)):
+        last = li == len(geo) - 1
+        cw = -(-g["c"] // P)                   # words per input pixel
+        common = dict(step_x=g["s"] * cw, step_y=g["s"] * g["w"] * cw,
+                      out_w=g["ow"], out_h=g["oh"], w_base=n_w, b_base=n_p,
+                      last=int(last))
+        if g["kind"] == "pool":
+            cfg.append(cfg_word(
+                li, kw=g["kw"], kh=g["kh"], rd_words=1, pix_step=cw,
+                row_step=(g["w"] - g["kw"] + 1) * cw, org=0,
+                in_w=g["w"], in_h=g["h"], pad=0, stride=g["s"],
+                out_ch=cw, pool=1, **common))
+            continue
+        if g["kind"] == "fc":
+            # one "pixel" that is the whole input
+            window = dict(kw=1, kh=1, rd_words=g["h"] * g["w"] * cw, pix_step=1,
+                          row_step=1, org=0, in_w=1, in_h=1, pad=0, stride=1)
+        else:
+            if g["oc"] % P and not last:
+                raise CompileError(f"layer {li}: convolution has {g['oc']} output "
+                                   "channels; the hardware needs a multiple of 8 "
+                                   "(pad_conv_channels does this)")
+            window = dict(kw=g["kw"], kh=g["kh"], rd_words=cw, pix_step=1,
+                          row_step=(g["w"] - g["kw"]) * cw + 1,
+                          org=(-(g["p"] * g["w"] + g["p"]) * cw) & 0xFFFF,
+                          in_w=g["w"], in_h=g["h"], pad=g["p"], stride=g["s"])
+        cfg.append(cfg_word(li, out_ch=g["oc"], pool=0, **window, **common))
+        w = q["w"].reshape(g["oc"], g["kh"], g["kw"], g["c"])
+        w_words = pack_words(pad_c(w).reshape(g["oc"], -1))
+        weights.append(w_words)
+        # per-output parameter word: bias, multiplier M, shift S
+        params.append((q["b"] & 0xFFFFFFFF) | (q["M"] << 32) | (q["S"] << 48))
+        n_w += len(w_words)
+        n_p += g["oc"]
+    return np.concatenate(weights), np.concatenate(params), cfg
+
+
+def requirements(geo, weights, params):
+    """What the network needs from the hardware."""
+    words = [g["h"] * g["w"] * -(-g["c"] // P) for g in geo]
+    words.append(geo[-1]["oh"] * geo[-1]["ow"] * -(-geo[-1]["oc"] // P))
+    return dict(layers=len(geo), weight_words=len(weights), param_words=len(params),
+                act_words=max(words), in_words=words[0],
+                n_out=geo[-1]["oh"] * geo[-1]["ow"] * geo[-1]["oc"])
+
+
+def check_limits(req, limits=LIMITS):
+    """Raise CompileError, naming every limit the network exceeds."""
+    problems = []
+    if req["layers"] > limits["MAX_LAYERS"]:
+        problems.append(f"{req['layers']} layers, the layer table holds {limits['MAX_LAYERS']}")
+    for what, key, aw in [("weight words", "weight_words", "W_AW"),
+                          ("activation words in one feature map", "act_words", "A_AW"),
+                          ("parameter words", "param_words", "B_AW")]:
+        if req[key] > (1 << limits[aw]):
+            need = int(np.ceil(np.log2(req[key])))
+            problems.append(f"{req[key]} {what}, {aw}={limits[aw]} holds "
+                            f"{1 << limits[aw]} (needs {aw}={need})")
+    if req["n_out"] > limits["MAX_OUT"]:
+        problems.append(f"{req['n_out']} outputs, the testbench handles {limits['MAX_OUT']}")
+    if problems:
+        raise CompileError("network does not fit the accelerator as configured:\n  "
+                           + "\n  ".join(problems))
+
+
+def cycles(geo):
+    """Clock cycles of multiply-accumulate / pooling per inference: one per
+    memory word read."""
+    total = 0
+    for g in geo:
+        cw = -(-g["c"] // P)
+        outs = g["oh"] * g["ow"]
+        if g["kind"] == "pool":
+            total += outs * cw * g["kh"] * g["kw"]
+        else:
+            total += outs * g["oc"] * g["kh"] * g["kw"] * cw
+    return total
+
+
+def export(out, geo, qparams, test_a, labels=None, limits=LIMITS):
+    """Write every file the RTL testbench and the FPGA build read.
+    `test_a` is (N,H,W,C) int 0..127, already in the network's input layout."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    logits, pred = golden(geo, qparams, test_a)
+    weights, params, cfg = compile_program(geo, qparams)
+    req = requirements(geo, weights, params)
+    check_limits(req, limits)
+    n = len(test_a)
+    images = pad_c(test_a).reshape(n, -1)
+    assert images.shape[1] // P == req["in_words"]
+    write_hex(out / "weights.hex", weights, 16)
+    write_hex(out / "params.hex", params, 14)
+    write_hex(out / "cfg.hex", cfg, CFG_BITS // 4)
+    write_hex(out / "meta.hex", [req["in_words"], len(cfg), logits.shape[1]], 8)
+    write_hex(out / "images.hex", pack_words(images), 16)
+    write_hex(out / "labels.hex", labels if labels is not None else pred, 2)
+    write_hex(out / "golden_class.hex", pred, 2)
+    write_hex(out / "golden_logits.hex", logits.reshape(-1), 8)
+    # test image 0 as input words, for the FPGA demo ROM
+    write_hex(out / "demo_image.hex", pack_words(images[:1]), 16)
+    return dict(req, logits=logits, pred=pred, mac_cycles=cycles(geo))
