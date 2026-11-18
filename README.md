@@ -25,7 +25,7 @@ Two networks run on the same hardware; only the memory images differ.
 | Accuracy, float / INT8 | 98.61% / 98.60% | 97.52% / 97.49% |
 | Weights | 7.2 KB | 50.8 KB |
 | RTL vs golden model, 10,000 images | 0 mismatches | 0 mismatches |
-| Clock cycles per inference | 11,355 | 6,379 |
+| Clock cycles per inference | 8,651 | 6,379 |
 
 Accuracy is on the 10,000-image MNIST test set, post-training quantization.
 "0 mismatches" means all 100,000 logits and 10,000 predicted classes match.
@@ -35,13 +35,21 @@ odd layer widths) and is checked the same way.
 
 An output value costs exactly as many cycles as its window has memory words.
 Everything after address generation is a feed-forward pipeline, so the front
-end issues consecutive outputs back to back. Of the CNN's 11,355 cycles,
-11,312 are multiply-accumulate.
+end issues consecutive outputs back to back. Of the CNN's 8,651 cycles,
+8,608 are multiply-accumulate.
 
-The CNN's input is stored space-to-depth: each 2×2 block of pixels becomes one
-4-channel pixel, so the 28×28 image is a 14×14×4 tensor. That is a pure
-rearrangement. A 2×2 convolution on it is the same arithmetic as a 4×4
-stride-2 convolution on the image, but its window is 4 memory words.
+Two layout tricks keep the first layer cheap. Both only move bytes around; the
+arithmetic, and so every result, is unchanged.
+
+- **Space-to-depth.** The CNN's input is stored with each 2×2 block of pixels
+  as one 4-channel pixel, so the 28×28 image is a 14×14×4 tensor. A 2×2
+  convolution on it is the same as a 4×4 stride-2 convolution on the image.
+- **Overlap packing.** A pixel normally takes one 8-byte word however few
+  channels it has, which leaves most multiplier lanes idle on a 1- or
+  3-channel image. Instead, each input word holds its own pixel and the next
+  few pixels of the row, so a kernel row is read in fewer, wider steps. A 3×3
+  window over RGB takes 6 words instead of 9; a 5×5 window over a grey image
+  takes 5 instead of 25.
 
 ## Bring your own model
 
@@ -64,7 +72,7 @@ make sim-full MEM=build/lenet5
 | INT8 picks the float model's class | 99.93% of test images |
 | RTL vs golden model, 10,000 images | 0 mismatches |
 | Weights | 63.8 KB |
-| Clock cycles per inference | 205,247 |
+| Clock cycles per inference | 79,807 |
 
 `examples/cifar10.onnx` is a small CNN for CIFAR-10, also trained in PyTorch
 (`examples/train_cifar10.py`): colour images, batch normalization, three
@@ -77,16 +85,14 @@ padded convolutions.
 | INT8 picks the float model's class | 96.64% of test images |
 | RTL vs golden model, 10,000 images | 0 mismatches |
 | Weights | 34.4 KB |
-| Clock cycles per inference | 447,318 |
+| Clock cycles per inference | 398,166 |
 
 ```bash
 python tools/compile.py examples/cifar10.onnx --out build/cifar10 --data cifar10
 make sim-full MEM=build/cifar10 N_FULL=1000
 ```
 
-Quantization costs 0.6 points here, against 0.03 for LeNet-5 on MNIST. A third
-of the cycles go to the first layer, where the 3 colour channels are padded to
-8 and five of the eight multipliers are idle.
+Quantization costs 0.6 points here, against 0.03 for LeNet-5 on MNIST.
 
 What the compiler does:
 
@@ -96,7 +102,8 @@ What the compiler does:
   channel counts are rounded up to a multiple of 8 with all-zero filters
   (LeNet's 6 becomes 8); a leading fully-connected layer gets a densely packed
   input; an even-sized stride-2 first convolution is moved onto a
-  space-to-depth input.
+  space-to-depth input; a first convolution over few channels reads an
+  overlap-packed input.
 - **Quantizes** to INT8 after training, using calibration images.
 - **Checks** the result against the hardware's capacity and refuses, with a
   message naming the limit, when the network does not fit.
@@ -122,7 +129,7 @@ Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
 | Standard cells | 19,987 combinational + 1,531 flip-flops |
 | Logic area | 142,457 µm² (0.142 mm²), 27% of it sequential |
 | Longest combinational path | 2.6 ns → roughly 380 MHz |
-| Time per inference at that clock | MNIST CNN ≈ 30 µs, LeNet-5 ≈ 0.54 ms, CIFAR-10 CNN ≈ 1.2 ms |
+| Time per inference at that clock | MNIST CNN ≈ 23 µs, LeNet-5 ≈ 0.21 ms, CIFAR-10 CNN ≈ 1.0 ms |
 | Memory as configured | 802 kbit: weights 524 kbit, 2 × 131 kbit activations, 14 kbit parameters, 1 kbit layer table |
 | Memory the CNN alone needs | 107 kbit: weights 66 kbit, 2 × 16 kbit activations, 7 kbit parameters, 1 kbit layer table |
 
@@ -147,7 +154,8 @@ comparable.
 | 4. Post unit overlaps the next output | 3.0 ns | 108,403 µm² | 6,460 | 20,051 |
 | 5. Feed-forward post pipeline, back-to-back outputs | 2.6 ns | 142,011 µm² | 6,377 | 11,352 |
 | 6. Padding, max pooling, per-channel requantization | 2.6 ns | 141,917 µm² | 6,379 | 11,355 |
-| 7. Current: larger memories (2,048-word buffers, 256 parameter words) | 2.6 ns | 142,457 µm² | 6,379 | 11,355 |
+| 7. Larger memories (2,048-word buffers, 256 parameter words) | 2.6 ns | 142,457 µm² | 6,379 | 11,355 |
+| 8. Current: overlap-packed input (compiler only, same hardware) | 2.6 ns | 142,457 µm² | 6,379 | 8,651 |
 
 What each step changed in the RTL:
 
@@ -172,6 +180,10 @@ What each step changed in the RTL:
   from one parameter word per output channel and travel with the output. The
   layer table moves from registers to a small memory and grows to 8 entries,
   which is why the logic area does not rise.
+
+- **8**: no RTL change. The compiler packs several input pixels into each word
+  and uses the pointer steps the hardware already had. LeNet-5 drops from
+  205,247 to 79,807 cycles and the CIFAR-10 CNN from 447,318 to 398,166.
 
 Step 5 trades area for speed: 31% more logic for a 13% shorter clock period
 and, on the CNN, 43% fewer cycles.
@@ -205,13 +217,17 @@ nextpnr-himbaechel, gowin_pack):
 
 | | MNIST CNN | LeNet-5 | CIFAR-10 CNN |
 |---|---|---|---|
-| Block RAM (of 46) | 14 | 41 | 35 |
-| LUT4 (of 20,736) | 2,787 | 3,041 | 3,056 |
-| Timing (27 MHz required) | 82 MHz | 82 MHz | 81 MHz |
+| Block RAM (of 46) | 16 | 44 | 42 |
+| LUT4 (of 20,736) | 2,797 | 3,100 | 3,111 |
+| Timing (27 MHz required) | 80 MHz | 84 MHz | 77 MHz |
 | Routed netlist in gate-level simulation | pass | not run | pass |
 
 Sizing matters: with power-of-two memories the CIFAR-10 network needs about
-48 block RAMs and does not fit.
+48 block RAMs and does not fit. Overlap packing costs some of that back: the
+input is stored with its padding (34×34 instead of 32×32 words for CIFAR-10),
+which pushes one buffer and the demo ROM past 1,024 words, so the two larger
+networks now use most of the board (35 → 42 and 41 → 44 block RAMs).
+`tools/compile.py --no-overlap` trades the cycles back for memory.
 
 What has and has not been checked:
 

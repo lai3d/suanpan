@@ -136,6 +136,75 @@ def test_rewrites_preserve_function():
     assert np.array_equal(nnc.s2d_weights(nnc.s2d_weights_inv(w, 4, 4, 1), 4, 4, 1), w)
 
 
+def hardware_walk(geo, weights, cfg, stored):
+    """Layer 0 as the accelerator executes it, from the exported images only:
+    walk each window with the descriptor's pointer steps and sum word-by-word
+    dot products. Independent of nnc.im2col and of the RTL."""
+    f, pos = {}, 0
+    for name, width in nnc.CFG_FIELDS:
+        f[name] = (cfg[0] >> pos) & ((1 << width) - 1)
+        pos += width
+    def lanes(word):                      # 8 signed bytes of a 64-bit word
+        b = np.array([(int(word) >> (8 * k)) & 0xFF for k in range(8)], np.int64)
+        return np.where(b > 127, b - 256, b)
+    wl = np.array([lanes(w) for w in weights])
+    mem = np.array([lanes(w) for w in stored])
+    out = np.zeros((f["out_h"], f["out_w"], f["out_ch"]), np.int64)
+    row_base = f["org"]
+    for oy in range(f["out_h"]):
+        pix_base = row_base
+        for ox in range(f["out_w"]):
+            w_ptr = f["w_base"]
+            for oc in range(f["out_ch"]):
+                a_ptr, acc = pix_base, 0
+                for kr in range(f["kh"]):
+                    for kx in range(f["kw"]):
+                        for kcw in range(f["rd_words"]):
+                            acc += int(wl[w_ptr] @ mem[a_ptr])
+                            w_ptr += 1
+                            last_w = kcw == f["rd_words"] - 1
+                            if last_w and kx == f["kw"] - 1:
+                                a_ptr += f["row_step"]
+                            elif last_w:
+                                a_ptr += f["pix_step"]
+                            else:
+                                a_ptr += 1
+                out[oy, ox, oc] = acc
+            pix_base += f["step_x"]
+        row_base += f["step_y"]
+    return out
+
+
+def test_overlap_packing_is_exact():
+    """Overlap packing changes only where bytes live. Executing the exported
+    layer table the way the hardware does must give the reference sums."""
+    for shape, spec in [((9, 9, 3), ("conv", 3, 1, 8, 1)),     # CIFAR-like, 2 pixels / word
+                        ((10, 10, 1), ("conv", 5, 1, 8, 2)),    # LeNet-like, 8 pixels / word
+                        ((9, 9, 1), ("conv", 3, 2, 8, 1)),      # stride 2 with padding
+                        ((8, 8, 4), ("conv", 2, 1, 8)),         # after space-to-depth
+                        ((8, 8, 2), ("conv", 5, 1, 8, 2))]:     # 4 pixels / word, 2 words / row
+        specs = [spec, ("fc", 3)]
+        geo = nnc.geometry(shape, specs)
+        assert nnc.apply_overlap(geo), (shape, spec)
+        g = geo[0]
+        fan = g["kh"] * g["kw"] * g["c"]
+        fparams = [(rand(8, fan), rand(8)), (rand(3, g["oh"] * g["ow"] * 8), rand(3))]
+        a = rng.integers(0, 128, (40, *shape))
+        q = nnc.quantize(geo, fparams, a)
+        weights, _, cfg = nnc.compile_program(geo, q)
+        stored = nnc.pack_words(nnc.pad_c(nnc.overlap_pack(a[:1], g)).reshape(1, -1))
+        ref = nnc.im2col(a[:1].astype(np.int64), g)[0] @ q[0]["w"].T        # no bias
+        got = hardware_walk(geo, weights, cfg, stored)
+        assert np.array_equal(got, ref), (shape, spec)
+        # and it really is shorter than one word per pixel
+        f_kw = cfg[0] & 0xF
+        assert f_kw < g["kw"]
+
+    # not applied when it cannot help: 8 channels fill a word, 1x1 has no row
+    for shape, spec in [((8, 8, 8), ("conv", 3, 1, 8)), ((8, 8, 1), ("conv", 1, 1, 8))]:
+        assert not nnc.apply_overlap(nnc.geometry(shape, [spec, ("fc", 3)]))
+
+
 def test_s2d_not_applied_when_unsafe():
     for specs in ([("conv", 3, 2, 8), ("fc", 3)],          # odd kernel
                   [("conv", 4, 1, 8), ("fc", 3)],          # stride 1
@@ -202,8 +271,10 @@ def test_roundtrip_is_byte_identical():
         src = ROOT / "build" / arch
         assert (src / "model.onnx").exists(), f"run `make model ARCH={arch}` first"
         out = TMP / arch
+        # stress is exported without overlap packing (see ARCHS in train.py)
+        extra = ["--no-overlap"] if arch == "stress" else []
         subprocess.run([sys.executable, str(ROOT / "tools" / "compile.py"), str(src / "model.onnx"),
-                        "--out", str(out), "--data", "mnist"], check=True, capture_output=True)
+                        "--out", str(out), "--data", "mnist", *extra], check=True, capture_output=True)
         for f in files:
             assert (out / f"{f}.hex").read_bytes() == (src / f"{f}.hex").read_bytes(), \
                 f"{arch}/{f}.hex differs after the ONNX round trip"

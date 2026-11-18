@@ -13,7 +13,7 @@ module tb_nn_accel;
     localparam int A_AW       = 11;
     localparam int MAX_LAYERS = 8;
     localparam int MAX_N      = 10000;
-    localparam int MAX_IN     = 1024;        // input words per image
+    localparam int MAX_IN     = 1 << A_AW;   // input words per image
     localparam int MAX_OUT    = 16;
 
     logic clk = 0, rst_n = 0;

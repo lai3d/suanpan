@@ -89,6 +89,9 @@ def compile_onnx(args):
         notes.append("first convolution rewritten onto a space-to-depth input")
 
     geo = nnc.geometry(input_shape, specs)
+    if not args.no_overlap and nnc.apply_overlap(geo):
+        notes.append(f"first convolution reads overlap-packed input, "
+                     f"{geo[0]['ovl']} pixels per word")
     qparams = nnc.quantize(geo, fparams, calib)
     info = nnc.export(args.out, geo, qparams, test, labels)
 
@@ -123,6 +126,8 @@ def main():
     ap.add_argument("--data", choices=sorted(datasets.LOADERS), help="built-in dataset")
     ap.add_argument("--calib", type=Path, help=".npz with calibration images")
     ap.add_argument("--test", type=Path, help=".npz with test images")
+    ap.add_argument("--no-overlap", action="store_true",
+                    help="keep one word per input pixel in the first convolution")
     ap.add_argument("--n-calib", type=int, default=10000)
     ap.add_argument("--n-test", type=int, default=10000)
     args = ap.parse_args()

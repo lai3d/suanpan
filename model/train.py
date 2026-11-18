@@ -40,7 +40,9 @@ ARCHS = {
     # pixels (the second with an odd input size), a 1x1 convolution whose
     # windows are a single word, a single-channel input padded to 8, and a
     # fully-connected width that is not a multiple of 8.
-    "stress": {"input": (28, 28, 1),
+    # It also opts out of overlap packing, so that the plain one-word-per-pixel
+    # first layer and its hardware padding stay covered.
+    "stress": {"input": (28, 28, 1), "overlap": False,
                "layers": [("conv", 3, 1, 8, 1), ("pool", 2, 2), ("conv", 1, 1, 8),
                           ("conv", 3, 2, 16, 1), ("pool", 2, 2), ("fc", 20), ("fc", 10)],
                "epochs": 2, "lr": 0.05},
@@ -149,6 +151,8 @@ def main():
     args = ap.parse_args()
     arch, n_test = ARCHS[args.arch], args.n_test
     geo = nnc.geometry(arch["input"], arch["layers"])
+    if arch.get("overlap", True):
+        nnc.apply_overlap(geo)
     out = ROOT / "build" / args.arch
 
     d = datasets.load_mnist()
