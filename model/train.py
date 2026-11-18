@@ -2,11 +2,12 @@
 RTL needs: weight/bias/layer-table memory images, test images, and bit-exact
 golden outputs from an integer-only reference model.
 
-    python model/train.py [--arch cnn|mlp] [--n-test N]
+    python model/train.py [--arch cnn|mlp|stress] [--n-test N]
 
 Architectures
     mlp:  784 -> fc 64 (ReLU) -> fc 10
     cnn:  28x28x1 -> conv3x3/2 x8 (ReLU) -> conv3x3/2 x16 (ReLU) -> fc 10
+    stress: hardware corner cases (1x1 conv, odd fc width), not for accuracy
 
 Hardware arithmetic (must match rtl/nn_accel.sv exactly):
     acc  = sum(w_int8 * x_int8) + bias_int32
@@ -44,6 +45,12 @@ ARCHS = {
     "cnn": {"input": (28, 28, 1),
             "layers": [("conv", 3, 2, 8), ("conv", 3, 2, 16), ("fc", 10)],
             "epochs": 12, "lr": 0.05},
+    # Not a useful network: a hardware stress test. The 1x1 convolution is a
+    # hidden layer with one-word windows, so the front end has to wait for
+    # the post unit; the 20-wide fc output is not a multiple of 8.
+    "stress": {"input": (28, 28, 1),
+               "layers": [("conv", 3, 2, 8), ("conv", 1, 1, 8), ("fc", 20), ("fc", 10)],
+               "epochs": 2, "lr": 0.05},
 }
 
 

@@ -4,7 +4,9 @@
 #
 # Adders are mapped to Kogge-Stone prefix adders and ABC runs a delay-oriented
 # script; the Yosys defaults produce ripple-carry chains that hide the real
-# critical path.
+# critical path. `-noabc` matters too: synth's built-in generic ABC pass is
+# area-oriented and, depending on the surrounding logic, collapses the prefix
+# adders back into carry chains, which makes results jump between revisions.
 #
 # Memories (sram_sp) stay black boxes: on a real chip they are SRAM macros,
 # not standard cells, and are accounted for separately.
@@ -23,7 +25,7 @@ yosys -q -l $OUT/yosys_$PERIOD.log -p "
     hierarchy -check -top nn_accel
     synth -top nn_accel -flatten -run :fine
     techmap -map +/techmap.v -map +/choices/kogge-stone.v
-    synth -top nn_accel -run fine:
+    synth -top nn_accel -noabc -run fine:
     dfflibmap -liberty $LIB
     abc -liberty $LIB -constr syn/abc.constr -script $PWD/syn/abc.script -D $PERIOD -dont_use sky130_fd_sc_hd__lpflow*
     opt_clean -purge

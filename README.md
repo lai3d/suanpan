@@ -19,19 +19,19 @@ Two networks run on the same hardware; only the memory images differ.
 | Accuracy, float / INT8 | 98.51% / 98.48% | 97.52% / 97.48% |
 | Weights | 7.5 KB | 50.8 KB |
 | RTL vs golden model, 10,000 images | 0 mismatches | 0 mismatches |
-| Clock cycles per inference | 47,072 | 7,389 |
+| Clock cycles per inference | 20,051 | 6,460 |
 
 Accuracy is on the 10,000-image MNIST test set, post-training quantization.
 "0 mismatches" means all 100,000 logits and 10,000 predicted classes match.
+A third network, `stress`, exists only to exercise hardware corner cases
+(one-word windows, odd layer widths) and is checked the same way.
 
-The CNN is more accurate with a seventh of the weights, but takes six times as
-many cycles. Two known reasons, both left for later:
+An output value costs (window words + 1) cycles: requantization and write-back
+run in a separate post unit while the next output's multiply-accumulate is
+already under way. Of the CNN's 20,051 cycles, 18,072 are multiply-accumulate.
 
-- per-output overhead: each output value spends about 15 cycles on pipeline
-  drain, bias and requantization. The CNN has 1,938 outputs, so that is 62% of
-  its cycles; the MAC loop itself is only 18,072.
-- the single-channel input is padded to 8 channels, so 7 of the 8 multipliers
-  in the first layer multiply zeros.
+One known inefficiency remains: the single-channel input is padded to 8
+channels, so 7 of the 8 multipliers in the first layer multiply zeros.
 
 ## Synthesis estimate (SKY130, pre-layout)
 
@@ -40,10 +40,10 @@ Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
 
 | Metric | Value |
 |---|---|
-| Standard cells | 10,109 combinational + 1,172 flip-flops |
-| Logic area | 86,135 µm² (0.086 mm²), 38% of it sequential |
-| Longest combinational path | 3.7 ns → roughly 270 MHz |
-| Time per inference at that clock | CNN ≈ 176 µs, MLP ≈ 28 µs |
+| Standard cells | 14,211 combinational + 1,314 flip-flops |
+| Logic area | 108,403 µm² (0.108 mm²), 33% of it sequential |
+| Longest combinational path | 3.0 ns → roughly 330 MHz |
+| Time per inference at that clock | CNN ≈ 60 µs, MLP ≈ 19 µs |
 | Memory as configured | 659 kbit: weights 524 kbit, 2 × 66 kbit activations, 4 kbit bias |
 | Memory the CNN alone needs | 201 kbit (weights fit in 66 kbit) |
 
@@ -52,32 +52,39 @@ placement, routing, clock tree or SRAM macro yet (SRAM access time may well
 set the real clock), and power is not estimated. Memory, not logic, will
 dominate chip area by a wide margin.
 
+The longest path runs from the layer counter through the activation-buffer
+select mux into the multipliers.
+
 ### History
 
-| Version | Path | Logic area | MLP cycles |
-|---|---|---|---|
-| Single-cycle requantization, adder chain in the dot product | 5.4 ns | 84,106 µm² | 6,929 |
-| 3-stage MAC pipeline, multi-cycle requantization | 4.0 ns | 70,249 µm² | 7,389 |
-| Current: + convolution (window addressing, wider layer table) | 3.7 ns | 86,135 µm² | 7,389 |
+Every row was re-synthesized with the current flow, so the columns are
+comparable.
 
-All rows use the same synthesis flow. The timing work changed the RTL so that:
+| Version | Path | Logic area | MLP cycles | CNN cycles |
+|---|---|---|---|---|
+| 1. Single-cycle requantization, adder chain in the dot product | 5.2 ns | 101,378 µm² | 6,929 | n/a |
+| 2. 3-stage MAC pipeline, multi-cycle requantization | 3.1 ns | 87,594 µm² | 7,389 | n/a |
+| 3. Convolution (window addressing, wider layer table) | 3.0 ns | 102,592 µm² | 7,389 | 47,072 |
+| 4. Current: post unit overlaps the next output | 3.0 ns | 108,403 µm² | 6,460 | 20,051 |
 
-- the dot product registers its 8 products, then sums them in a balanced tree;
-- `acc × M` uses one 9×17 multiplier over four cycles instead of a 32×17
-  multiplier, and round / shift / clamp each get their own cycle;
-- layer parameters are latched once per layer instead of being muxed from the
-  layer table on every path;
-- accumulate + bias share one explicit 32-bit adder, and the requantization
-  steps share one explicit 48-bit adder.
+What each step changed in the RTL:
 
-Convolution added no datapath, only address counters and a wider layer table
-(4 × 144 bits of registers, most of the area increase). The difference between
-4.0 and 3.7 ns is within the noise of the mapper, not an improvement.
+- **2**: the dot product registers its 8 products and sums them in a balanced
+  tree; `acc × M` uses one 9×17 multiplier over four cycles instead of a 32×17
+  multiplier, with round / shift / clamp in their own cycles; layer parameters
+  are latched once per layer; the adders are shared explicitly.
+- **3**: no new datapath, only address counters and a wider layer table
+  (4 × 144 bits of registers).
+- **4**: the controller is split into a front end (addresses) and a post unit
+  (requantize + write back) that run concurrently; the bias becomes the
+  accumulator's initial value instead of a separate add.
 
-A note on the flow: Yosys' default adder mapping and ABC's default script
-produce ripple-carry chains, which made a first estimate read 12.2 ns.
-`syn/synth.sh` maps adders to Kogge-Stone and uses a delay-oriented ABC script
-(`syn/abc.script`); most of the drop from 12.2 ns came from that, not from RTL.
+A note on the flow. Yosys and ABC defaults are area-oriented and turn adders
+into ripple-carry chains, which made the very first estimate read 12.2 ns and
+later made results jump between revisions for no RTL reason. `syn/synth.sh`
+maps adders to Kogge-Stone, skips Yosys' built-in generic ABC pass (`-noabc`)
+and uses a delay-oriented ABC script (`syn/abc.script`). Earlier versions of
+this table, produced before `-noabc`, showed smaller areas and slower paths.
 
 ## Architecture
 
@@ -99,14 +106,14 @@ flowchart LR
         mul --> tree --> acc
     end
 
-    subgraph rq[Requantization, once per output]
+    subgraph rq[Post unit, requantization, runs alongside the next output]
         hmul[× M<br/>9×17 multiplier, 4 cycles]
         rnd[Round and shift by S]
         clamp[Clamp to 0..127]
         hmul --> rnd --> clamp
     end
 
-    ctrl[Controller FSM,<br/>window address counters<br/>and layer table]
+    ctrl[Front-end FSM,<br/>window address counters<br/>and layer table]
     out([Logits and argmax])
 
     host -- input image --> bufa
@@ -114,7 +121,7 @@ flowchart LR
     wmem -- 8 weights per cycle --> mul
     bufa -- 8 activations per cycle --> mul
     bufb -- 8 activations per cycle --> mul
-    bmem -- bias --> acc
+    bmem -- bias as initial value --> acc
     acc -- hidden layer --> hmul
     clamp -- int8 outputs --> bufb
     clamp -- int8 outputs --> bufa
@@ -145,8 +152,8 @@ scale per layer rather than per channel.
 
 - `rtl/dot_unit.sv` — 8-lane signed 8×8 dot product (the compute core):
   registered multipliers feeding a balanced adder tree.
-- `rtl/nn_accel.sv` — controller FSM, window addressing, MAC pipeline,
-  requantization, argmax. The network is a table of layer descriptors written
+- `rtl/nn_accel.sv` — front-end FSM with window addressing, MAC pipeline,
+  post unit (requantization, write-back, argmax). The network is a table of layer descriptors written
   by the host, so a different network only needs new memory images, not new RTL.
 - `rtl/sram_sp.sv` — synchronous-read memory (SRAM macro / block RAM).
 - `model/train.py` — numpy training (CNN or MLP), quantization, memory-image
@@ -166,8 +173,8 @@ make lint
 make synth      # SKY130 logic synthesis (needs yosys), PERIOD=<ps>
 ```
 
-Add `ARCH=mlp` to `model`, `sim`, `sim-full` or `wave` to use the MLP instead
-of the default CNN.
+Add `ARCH=mlp` (or `ARCH=stress`) to `model`, `sim`, `sim-full` or `wave` to
+use another network instead of the default CNN.
 
 ## License
 
