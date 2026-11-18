@@ -1,5 +1,5 @@
-// Tang Nano 20K demo: classify one MNIST digit held in ROM and show the
-// result on the LEDs.
+// Tang Nano 20K demo: an MNIST classifier with LED output and a UART host
+// interface.
 //
 // After power-on (or any press/release of button S1) the wrapper
 //   1. writes the layer table into the accelerator,
@@ -13,6 +13,15 @@
 //   led[4]    lit while running
 //   led[5]    lit when a result is being shown
 //
+// UART (8N1, through the board's USB bridge). Commands are accepted only
+// while idle, one at a time:
+//   'P'                         -> 'K'                       (ping)
+//   'I' + IN_WORDS*8 bytes      -> class (1 byte) + N_OUT logits
+//         input words, each 8 bytes little-endian;   logits are int32,
+//         i.e. the image in buffer A's layout        little-endian
+// If an image stalls for RX_TIMEOUT cycles the command is dropped, so a lost
+// byte cannot leave the receiver out of step for good.
+//
 // The network is the default CNN; memory images come from `make model`.
 module top #(
     // Memory images, read at synthesis time (paths relative to the repo root).
@@ -22,11 +31,16 @@ module top #(
     parameter     IMG_FILE  = "build/cnn/demo_image.hex",
     parameter int N_LAYERS  = 3,
     parameter int IN_WORDS  = 196,
-    parameter int A_AW      = 8,      // activation buffers: 2^A_AW words
-    parameter int POR_BITS  = 16      // power-on reset length (2^POR_BITS cycles)
+    parameter int N_OUT     = 10,
+    parameter int A_AW      = 8,        // activation buffers: 2^A_AW words
+    parameter int POR_BITS  = 16,       // power-on reset length (2^POR_BITS cycles)
+    parameter int CLKS_PER_BIT = 234,   // 27 MHz / 115200 baud
+    parameter int RX_TIMEOUT   = 3375000  // 125 ms at 27 MHz
 ) (
     input  logic       clk,           // 27 MHz
     input  logic       btn,           // S1
+    input  logic       uart_rx,
+    output logic       uart_tx,
     output logic [5:0] led
 );
     // ------------------------------------------------- reset and re-run
@@ -61,6 +75,15 @@ module top #(
         end
     end
 
+    // ------------------------------------------------------------ UART
+    logic [7:0] rx_data, tx_data;
+    logic       rx_valid, tx_valid, tx_ready;
+
+    uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (
+        .clk, .rst_n, .rx(uart_rx), .data(rx_data), .valid(rx_valid));
+    uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (
+        .clk, .rst_n, .data(tx_data), .valid(tx_valid), .ready(tx_ready), .tx(uart_tx));
+
     // ------------------------------------------------------------ ROMs
     logic [143:0] cfg_rom [0:3];
     logic [63:0]  img_rom [0:(1<<A_AW)-1];
@@ -70,14 +93,14 @@ module top #(
     end
 
     // ----------------------------------------------------- accelerator
-    logic         cfg_we, in_we, start, busy, done;
+    logic         cfg_we, in_we, start, busy, done, logit_valid;
     logic [1:0]   cfg_addr;
     logic [143:0] cfg_data;
     logic [A_AW-1:0] in_addr;
     logic [63:0]  in_data;
-    logic [7:0]   class_idx;
+    logic [7:0]   class_idx, logit_idx;
+    logic signed [31:0] logit_data;
 
-    /* verilator lint_off PINCONNECTEMPTY */
     nn_accel #(
         .W_AW(10), .A_AW(A_AW),
         .W_FILE(W_FILE),
@@ -85,12 +108,17 @@ module top #(
     ) u_accel (
         .clk, .rst_n, .cfg_we, .cfg_addr, .cfg_data, .in_we, .in_addr, .in_data,
         .start, .num_layers(3'(N_LAYERS)), .busy, .done, .class_idx,
-        .logit_valid(), .logit_idx(), .logit_data()
+        .logit_valid, .logit_idx, .logit_data
     );
-    /* verilator lint_on PINCONNECTEMPTY */
+
+    // logits of the latest run, for the UART reply
+    logic [31:0] logit_mem [0:15];
+    always_ff @(posedge clk) if (logit_valid) logit_mem[logit_idx[3:0]] <= logit_data;
 
     // ------------------------------------------------------- sequencer
-    typedef enum logic [2:0] {T_CFG, T_IMG, T_START, T_WAIT, T_SHOW} tstate_t;
+    typedef enum logic [2:0] {
+        T_CFG, T_IMG, T_START, T_WAIT, T_REPLY, T_IDLE, T_RX, T_PONG
+    } tstate_t;
     tstate_t     tstate;
     logic [10:0] cnt;          // layer index, then input word index
     logic [63:0] pixel;        // synchronous ROM read
@@ -98,15 +126,42 @@ module top #(
     logic [A_AW-1:0] pixel_addr;
     logic [3:0]  result;
     logic        have_result;
+    logic        from_uart;    // the run in progress was requested over UART
+
+    // UART image reception: bytes are shifted into a word, LSB first
+    logic [63:0]     wsh;
+    logic [2:0]      bcnt;
+    logic            uw_we;
+    logic [A_AW-1:0] uw_addr;
+    logic [63:0]     uw_data;
+    logic [$clog2(RX_TIMEOUT+1)-1:0] tcnt;
+
+    // UART reply: byte 0 is the class, then N_OUT little-endian int32
+    localparam int REPLY_LEN = 1 + 4 * N_OUT;
+    logic [6:0]  rcnt;
+    logic [6:0]  ridx;
+    logic [31:0] rword;
+    logic [7:0]  rbyte;
+    assign ridx  = rcnt - 7'd1;
+    assign rword = logit_mem[ridx[5:2]];
+    always_comb begin
+        case (ridx[1:0])
+            2'd0:    rbyte = rword[7:0];
+            2'd1:    rbyte = rword[15:8];
+            2'd2:    rbyte = rword[23:16];
+            default: rbyte = rword[31:24];
+        endcase
+        if (rcnt == '0) rbyte = {4'd0, result};
+    end
 
     always_ff @(posedge clk) pixel <= img_rom[cnt[A_AW-1:0]];
 
     assign cfg_data = cfg_rom[cnt[1:0]];
     assign cfg_addr = cnt[1:0];
     assign cfg_we   = (tstate == T_CFG);
-    assign in_we    = pixel_v;
-    assign in_addr  = pixel_addr;
-    assign in_data  = pixel;
+    assign in_we    = pixel_v | uw_we;
+    assign in_addr  = uw_we ? uw_addr : pixel_addr;
+    assign in_data  = uw_we ? uw_data : pixel;
     assign start    = (tstate == T_START);
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -117,9 +172,21 @@ module top #(
             pixel_addr  <= '0;
             result      <= '0;
             have_result <= 1'b0;
+            from_uart   <= 1'b0;
+            wsh         <= '0;
+            bcnt        <= '0;
+            uw_we       <= 1'b0;
+            uw_addr     <= '0;
+            uw_data     <= '0;
+            tcnt        <= '0;
+            rcnt        <= '0;
+            tx_valid    <= 1'b0;
+            tx_data     <= '0;
         end else begin
             pixel_v    <= (tstate == T_IMG);
             pixel_addr <= cnt[A_AW-1:0];
+            uw_we      <= 1'b0;
+            tx_valid   <= 1'b0;
 
             case (tstate)
                 T_CFG: begin
@@ -140,20 +207,65 @@ module top #(
                     end
                 end
 
-                // pixel_v trails T_IMG by one cycle, so the last pixel is
-                // written during T_START, before the accelerator reads it
+                // the last input word (from ROM or UART) is written during
+                // T_START, before the accelerator reads it
                 T_START: tstate <= T_WAIT;
 
                 T_WAIT: if (done) begin
                     result      <= class_idx[3:0];
                     have_result <= 1'b1;
-                    tstate      <= T_SHOW;
+                    rcnt        <= '0;
+                    if (from_uart) tstate <= T_REPLY;
+                    else           tstate <= T_IDLE;
                 end
 
-                T_SHOW: if (rerun) begin
-                    have_result <= 1'b0;
-                    cnt         <= '0;
-                    tstate      <= T_CFG;
+                T_REPLY: if (tx_ready && !tx_valid) begin
+                    tx_data  <= rbyte;
+                    tx_valid <= 1'b1;
+                    rcnt     <= rcnt + 7'd1;
+                    if (rcnt == 7'(REPLY_LEN - 1)) tstate <= T_IDLE;
+                end
+
+                T_IDLE: begin
+                    if (rerun) begin
+                        have_result <= 1'b0;
+                        from_uart   <= 1'b0;
+                        cnt         <= '0;
+                        tstate      <= T_CFG;
+                    end else if (rx_valid && rx_data == "P") begin
+                        tstate <= T_PONG;
+                    end else if (rx_valid && rx_data == "I") begin
+                        have_result <= 1'b0;
+                        from_uart   <= 1'b1;
+                        cnt         <= '0;
+                        bcnt        <= '0;
+                        tcnt        <= '0;
+                        tstate      <= T_RX;
+                    end
+                end
+
+                T_RX: begin
+                    tcnt <= tcnt + 1'b1;
+                    if (rx_valid) begin
+                        tcnt <= '0;
+                        wsh  <= {rx_data, wsh[63:8]};
+                        bcnt <= bcnt + 3'd1;
+                        if (bcnt == 3'd7) begin
+                            uw_we   <= 1'b1;
+                            uw_addr <= cnt[A_AW-1:0];
+                            uw_data <= {rx_data, wsh[63:8]};
+                            cnt     <= cnt + 1'b1;
+                            if (cnt == 11'(IN_WORDS - 1)) tstate <= T_START;
+                        end
+                    end else if (tcnt == ($bits(tcnt))'(RX_TIMEOUT)) begin
+                        tstate <= T_IDLE;                // stalled: drop the command
+                    end
+                end
+
+                T_PONG: if (tx_ready && !tx_valid) begin
+                    tx_data  <= "K";
+                    tx_valid <= 1'b1;
+                    tstate   <= T_IDLE;
                 end
 
                 default: tstate <= T_CFG;

@@ -21,6 +21,7 @@ make synth      # Yosys + ABC onto SKY130, PERIOD=<ps>
 make fpga-sim      # Tang Nano 20K wrapper in RTL simulation
 make fpga          # synth_gowin + nextpnr-himbaechel + gowin_pack -> build/fpga/top.fs
 make fpga-gatesim  # simulate the placed-and-routed netlist
+make fpga-load     # openFPGALoader, SRAM (volatile); fpga-flash writes flash
 ```
 
 The `fpga` targets need the OSS CAD Suite on `PATH` (Homebrew has no `nextpnr-himbaechel`). Vendor tools are not an option on macOS.
@@ -75,7 +76,9 @@ Things that follow from this design:
 - **A failing gate-level simulation is not automatically a design bug.** Yosys' Gowin simulation library declares the block RAM (`SPX9`) and the multipliers as black boxes, so their outputs are X. `fpga/gowin_sim.v` holds behavioural models written from Yosys' own mapping files (`brams_map.v`, `dsp_map.v`), and `fpga/gatesim.sh` swaps them in. If synthesis starts using a cell that has no model there, the symptom is X on the outputs with a correct cycle count.
 - **Partially initialized ROMs look uninitialized in a dump.** Yosys prints `INIT` MSB-first, so a ROM whose upper addresses are unused starts with a long run of `x`. Count defined bits before concluding a `$readmemh` did not load.
 - **Block RAMs are limited to 18-bit data** in `fpga/tangnano20k/build.sh`, by running the memory-mapping step of `synth_gowin` by hand with a copy of Yosys' `brams.txt` that omits width 36. Any 36-bit `SPX9` makes nextpnr report hold violations on its `ADB*` pins, for every seed. Small, wide memories are the ones Yosys maps that way, so shrinking a buffer can make the violations appear.
-- **Board facts.** Pins are from Sipeed's example repo (clock 4, LEDs 15-20 active low, button 88). The button's polarity is unverified, which is why the wrapper triggers on any debounced change.
+- **UART protocol lives in three places** that must agree: the sequencer in `fpga/tangnano20k/top.sv`, the host model in `tb/tb_fpga_top.sv`, and `tools/host.py`. `host.py` has never talked to a real board; `python tools/host.py frames` exercises its framing without one.
+- **Gate-level simulation runs at the real baud rate**, so receiving a whole image takes millions of cycles. `make fpga-gatesim` therefore only pings. To check image reception on a routed netlist, build a fast variant (`BAUD=1000000 OUT=build/fpga1m fpga/tangnano20k/build.sh`) and run the testbench with `+CPB=27 +N=1`.
+- **Board facts.** Pins are from Sipeed's example repo (clock 4, LEDs 15-20 active low, button 88, UART tx 69 / rx 70). The button's polarity is unverified, which is why the wrapper triggers on any debounced change.
 
 ## Reporting numbers
 

@@ -110,28 +110,43 @@ and uses a delay-oriented ABC script (`syn/abc.script`).
 `fpga/tangnano20k` is a self-contained demo for the Sipeed Tang Nano 20K
 (Gowin GW2AR-18): on power-up it loads one MNIST digit from ROM into the
 accelerator, runs the CNN, and shows the predicted class on the LEDs. A button
-press runs it again.
+press runs it again. Over the board's USB serial port a host can also send any
+image and get back the class and all ten logits, which allows the same
+bit-exact comparison on hardware that the testbench makes in simulation.
 
 It builds with the open-source flow (Yosys, nextpnr-himbaechel, gowin_pack):
 
 | Metric | Value |
 |---|---|
-| Timing | 94 MHz achievable, 27 MHz required (board oscillator) |
-| LUT4 | 2,338 of 20,736 (11%) |
-| Flip-flops | 1,340 of 15,552 (8%) |
+| Timing | 98 MHz achievable, 27 MHz required (board oscillator) |
+| LUT4 | 2,823 of 20,736 (13%) |
+| Flip-flops | 1,655 of 15,552 (10%) |
 | Block RAM | 14 of 46 (30%) |
 | DSP multipliers | 8 × 9×9 and 4 × 18×18 |
 
 What has and has not been checked:
 
-- The board wrapper passes in RTL simulation (`make fpga-sim`).
+- The board wrapper passes in RTL simulation (`make fpga-sim`). The testbench
+  plays the host: it pings, sends images over the UART and checks the class
+  and every logit, and checks that a stalled command is dropped.
 - The placed-and-routed netlist passes in gate-level simulation
   (`make fpga-gatesim`), using behavioural models of the Gowin block RAM and
   multipliers written for this repo. Those models follow Yosys' own mapping
   conventions; they are not vendor models.
 - **It has not been run on a physical board.** Pin numbers come from Sipeed's
   example repository; the button's polarity is unverified, so the wrapper
-  re-runs on any change of the button.
+  re-runs on any change of the button. `tools/host.py` has only been run
+  without a board.
+
+UART protocol (8N1, 115200 baud by default; `BAUD=<rate> make fpga` to change):
+
+| Host sends | Board replies |
+|---|---|
+| `P` | `K` |
+| `I` + 196 input words, 8 bytes each, little-endian | class (1 byte) + 10 logits, int32 little-endian |
+
+A command that stalls for 125 ms is dropped, so a lost byte cannot leave the
+link out of step.
 
 The build restricts block RAMs to 18-bit data. In the 36-bit single-port mode
 nextpnr reports hold violations on every such block, for every placement;
@@ -219,7 +234,9 @@ scale per layer rather than per channel.
 - `model/train.py` — numpy training, quantization, memory-image export, and
   the bit-exact integer reference model.
 - `tb/tb_nn_accel.sv` — self-checking testbench.
-- `fpga/` — Tang Nano 20K demo, build script and gate-level simulation models.
+- `fpga/` — Tang Nano 20K demo, UART, build script and gate-level simulation
+  models.
+- `tools/host.py` — host side of the UART interface.
 
 ## Run
 
@@ -237,6 +254,11 @@ make synth      # SKY130 logic synthesis (needs yosys), PERIOD=<ps>
 make fpga-sim      # Tang Nano 20K wrapper, RTL simulation
 make fpga          # synthesis, place and route -> build/fpga/top.fs
 make fpga-gatesim  # simulate the routed netlist
+make fpga-load     # load the bitstream into SRAM (lost at power-off)
+make fpga-flash    # write the bitstream to the board's flash
+
+python tools/host.py --port <serial device> ping
+python tools/host.py --port <serial device> run --n 10000
 ```
 
 The `fpga` targets need `nextpnr-himbaechel` and `gowin_pack` on `PATH`; the
