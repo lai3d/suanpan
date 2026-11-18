@@ -66,3 +66,9 @@ jobs:
 
       - name: Synthesize (SKY130)
         run: make synth
+
+      - name: FPGA wrapper, RTL simulation
+        run: make fpga-sim PY=python
+
+      - name: FPGA build and gate-level simulation (Tang Nano 20K)
+        run: make fpga-gatesim PY=python

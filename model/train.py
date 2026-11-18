@@ -300,6 +300,9 @@ def main():
     write_hex(out / "labels.hex", yte[:n_test], 2)
     write_hex(out / "golden_class.hex", pred[:n_test], 2)
     write_hex(out / "golden_logits.hex", logits[:n_test].reshape(-1), 8)
+    # one image as raw bytes (channel 0 only) for the FPGA demo ROM
+    write_hex(out / "demo_image.hex", xte[0], 2)
+    print(f"demo image     : test image 0, label {yte[0]}, predicted {pred[0]}")
     macs = sum(g["oh"] * g["ow"] * g["oc"] * g["kh"] * g["kw"] * g["c"] for g in geo)
     print(f"weight words   : {len(weights)}  ({len(weights) * 8} bytes)")
     print(f"biases         : {len(biases)}")

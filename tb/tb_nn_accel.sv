@@ -31,7 +31,13 @@ module tb_nn_accel;
     logic [7:0]         class_idx, logit_idx;
     logic signed [31:0] logit_data;
 
+    // GATE: a synthesized netlist has no parameters and no named memories;
+    // its weight and bias ROMs are baked in at synthesis time.
+`ifdef GATE
+    nn_accel dut (
+`else
     nn_accel #(.P(P), .A_AW(A_AW), .MAX_LAYERS(MAX_LAYERS)) dut (
+`endif
         .clk, .rst_n, .cfg_we, .cfg_addr, .cfg_data, .in_we, .in_addr, .in_data,
         .start, .num_layers, .busy, .done, .class_idx,
         .logit_valid, .logit_idx, .logit_data
@@ -69,8 +75,10 @@ module tb_nn_accel;
             $dumpvars(0, tb_nn_accel);
         end
         // weight and bias memories are ROM images on the chip
+`ifndef GATE
         $readmemh({mem, "/weights.hex"}, dut.u_wmem.mem);
         $readmemh({mem, "/bias.hex"}, dut.u_bmem.mem);
+`endif
         $readmemh({mem, "/cfg.hex"}, cfg_rom);
         $readmemh({mem, "/meta.hex"}, meta);
         $readmemh({mem, "/images.hex"}, images);

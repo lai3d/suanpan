@@ -9,7 +9,7 @@ MEM  := build/$(ARCH)
 # override VOBJ if this checkout lives under one.
 VOBJ ?= build/obj
 
-.PHONY: model sim sim-full wave lint synth clean
+.PHONY: model sim sim-full wave lint synth fpga fpga-sim fpga-gatesim clean
 
 # Train + quantize the network, export memory images and golden vectors.
 model $(MEM)/weights.hex:
@@ -41,6 +41,23 @@ lint:
 PERIOD ?= 10000
 synth:
 	syn/synth.sh $(PERIOD)
+
+# --- Tang Nano 20K demo (needs the OSS CAD Suite on PATH) -----------------
+FPGA_TOP := fpga/tangnano20k/top.sv
+
+# RTL simulation of the board wrapper: the LEDs must show the golden class.
+fpga-sim: build/cnn/weights.hex
+	iverilog -g2012 -o build/tb_fpga.vvp $(RTL) $(FPGA_TOP) tb/tb_fpga_top.sv
+	vvp -n build/tb_fpga.vvp | tee build/fpga-sim.log
+	@grep -q "RESULT: PASS" build/fpga-sim.log
+
+# Synthesis, place and route, bitstream -> build/fpga/top.fs
+fpga: build/cnn/weights.hex
+	fpga/tangnano20k/build.sh
+
+# Simulate the exact netlist that was placed and routed.
+fpga-gatesim: fpga
+	fpga/gatesim.sh build/fpga/top_synth.v tb/tb_fpga_top.sv tb_fpga_top
 
 clean:
 	rm -rf build

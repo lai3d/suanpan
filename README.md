@@ -5,7 +5,11 @@
 An AI chip designed from scratch, one stage at a time. The name is the Chinese
 abacus: like its beads, the core of the chip multiplies and accumulates.
 
-**Stage 1 (current): RTL + simulation.** A from-scratch hardware accelerator
+The plan has three stages: RTL and simulation, FPGA, then ASIC tapeout. What
+each one means, costs and proves is in [docs/three-stages.md](docs/three-stages.md)
+([中文版](docs/three-stages.zh-CN.md)).
+
+**Stage 1 (done): RTL + simulation.** A from-scratch hardware accelerator
 for INT8 convolutional and fully-connected inference, verified bit-exactly in
 simulation against an integer golden model on MNIST.
 
@@ -85,6 +89,38 @@ later made results jump between revisions for no RTL reason. `syn/synth.sh`
 maps adders to Kogge-Stone, skips Yosys' built-in generic ABC pass (`-noabc`)
 and uses a delay-oriented ABC script (`syn/abc.script`). Earlier versions of
 this table, produced before `-noabc`, showed smaller areas and slower paths.
+
+## FPGA (stage 2, in progress)
+
+`fpga/tangnano20k` is a self-contained demo for the Sipeed Tang Nano 20K
+(Gowin GW2AR-18): on power-up it loads one MNIST digit from ROM into the
+accelerator, runs the CNN, and shows the predicted class on the LEDs. A button
+press runs it again.
+
+It builds with the open-source flow (Yosys, nextpnr-himbaechel, gowin_pack):
+
+| Metric | Value |
+|---|---|
+| Timing | 101 MHz achievable, 27 MHz required (board oscillator) |
+| LUT4 | 2,295 of 20,736 (11%) |
+| Flip-flops | 1,027 of 15,552 (6%) |
+| Block RAM | 13 of 46 (28%) |
+| DSP multipliers | 8 × 9×9 and 1 × 18×18 |
+
+What has and has not been checked:
+
+- The board wrapper passes in RTL simulation (`make fpga-sim`).
+- The placed-and-routed netlist passes in gate-level simulation
+  (`make fpga-gatesim`), using behavioural models of the Gowin block RAM and
+  multipliers written for this repo. Those models follow Yosys' own mapping
+  conventions; they are not vendor models.
+- **It has not been run on a physical board.** Pin numbers come from Sipeed's
+  example repository; the button's polarity is unverified, so the wrapper
+  re-runs on any change of the button.
+
+The numbers are for the CNN-only memory configuration (1,024 weight words).
+The full configuration used for the ASIC estimate synthesizes to 38 block RAMs,
+within the device's 46, but that variant has not been placed and routed.
 
 ## Architecture
 
@@ -171,7 +207,14 @@ make sim-full   # all 10,000 images, Verilator
 make wave       # one image, dumps build/tb.vcd
 make lint
 make synth      # SKY130 logic synthesis (needs yosys), PERIOD=<ps>
+
+make fpga-sim      # Tang Nano 20K wrapper, RTL simulation
+make fpga          # synthesis, place and route -> build/fpga/top.fs
+make fpga-gatesim  # simulate the routed netlist
 ```
+
+The `fpga` targets need `nextpnr-himbaechel` and `gowin_pack` on `PATH`; the
+[OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build) provides both.
 
 Add `ARCH=mlp` (or `ARCH=stress`) to `model`, `sim`, `sim-full` or `wave` to
 use another network instead of the default CNN.
