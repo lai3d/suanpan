@@ -13,7 +13,7 @@ N_FULL ?= 10000
 # override VOBJ if this checkout lives under one.
 VOBJ ?= build/obj
 
-.PHONY: model sim sim-full wave lint synth test-compiler lenet5 fpga fpga-sim fpga-gatesim fpga-load fpga-flash clean
+.PHONY: model sim sim-full wave lint synth test-compiler lenet5 cifar10 cifar10-ci fpga fpga-sim fpga-gatesim fpga-load fpga-flash clean
 
 # Train + quantize the network, export memory images and golden vectors.
 model $(MEM)/weights.hex:
@@ -55,6 +55,18 @@ test-compiler:
 # Compile the PyTorch LeNet-5 in examples/ -> build/lenet5
 lenet5:
 	$(PY) tools/compile.py examples/lenet5.onnx --out build/lenet5 --data mnist
+
+# Compile the PyTorch CIFAR-10 network in examples/ -> build/cifar10
+# (downloads CIFAR-10, 163 MB, on first use)
+cifar10:
+	$(PY) tools/compile.py examples/cifar10.onnx --out build/cifar10 --data cifar10
+
+# The same network from the small image subsets committed in examples/, so it
+# can be compiled and simulated without the dataset. Quantization is
+# calibrated on 128 images here, so accuracy differs from `make cifar10`.
+cifar10-ci:
+	$(PY) tools/compile.py examples/cifar10.onnx --out build/cifar10-ci \
+	    --calib examples/cifar10_calib.npz --test examples/cifar10_test.npz
 
 # --- Tang Nano 20K demo (needs the OSS CAD Suite on PATH) -----------------
 FPGA_TOP := fpga/uart.sv fpga/tangnano20k/top.sv

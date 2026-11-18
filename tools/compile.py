@@ -6,8 +6,9 @@
 The model must take images scaled to [0, 1]. Calibration data sets the
 quantization scales; test data becomes the vectors the RTL testbench checks.
 Both are .npz files with `x` (N, C, H, W) or (N, H, W), either float in
-[0, 1] or uint8, and optionally labels `y`. `--data mnist` uses the MNIST
-training set for calibration and its test set for the vectors.
+[0, 1] or uint8, and optionally labels `y`. `--data mnist` or `--data cifar10`
+uses that dataset's training set for calibration and its test set for the
+vectors.
 
 Output: the memory images and golden vectors in --out, ready for
     make sim MEM=<out>
@@ -21,6 +22,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "model"))
 
+import datasets     # noqa: E402
 import nnc          # noqa: E402
 import onnx_io      # noqa: E402
 
@@ -48,14 +50,12 @@ def load_npz(path):
 
 
 def load_data(args):
-    if args.data == "mnist":
-        import train
-        d = train.load_mnist()
-        calib = to_int_nhwc(d["train_x"][:args.n_calib].reshape(-1, 1, 28, 28))
-        test = to_int_nhwc(d["test_x"][:args.n_test].reshape(-1, 1, 28, 28))
-        return calib, test, d["test_y"][:args.n_test].astype(np.int64)
+    if args.data:
+        d = datasets.LOADERS[args.data]()
+        return (to_int_nhwc(d["train_x"][:args.n_calib]), to_int_nhwc(d["test_x"][:args.n_test]),
+                d["test_y"][:args.n_test])
     if not (args.calib and args.test):
-        raise nnc.CompileError("give --data mnist, or both --calib and --test")
+        raise nnc.CompileError("give --data <dataset>, or both --calib and --test")
     calib, _ = load_npz(args.calib)
     test, labels = load_npz(args.test)
     return calib[:args.n_calib], test[:args.n_test], None if labels is None else labels[:args.n_test]
@@ -120,7 +120,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("model", type=Path, help="ONNX model")
     ap.add_argument("--out", type=Path, required=True, help="output directory")
-    ap.add_argument("--data", choices=["mnist"], help="built-in dataset")
+    ap.add_argument("--data", choices=sorted(datasets.LOADERS), help="built-in dataset")
     ap.add_argument("--calib", type=Path, help=".npz with calibration images")
     ap.add_argument("--test", type=Path, help=".npz with test images")
     ap.add_argument("--n-calib", type=int, default=10000)

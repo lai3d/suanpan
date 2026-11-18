@@ -66,6 +66,28 @@ make sim-full MEM=build/lenet5
 | Weights | 63.8 KB |
 | Clock cycles per inference | 205,247 |
 
+`examples/cifar10.onnx` is a small CNN for CIFAR-10, also trained in PyTorch
+(`examples/train_cifar10.py`): colour images, batch normalization, three
+padded convolutions.
+
+| CIFAR-10 CNN from PyTorch | |
+|---|---|
+| Layers | (conv 3×3 pad 1 → BN → ReLU → pool) × 3 with 16 / 32 / 64 channels → fc 10 |
+| Accuracy, float / INT8 | 81.13% / 80.54% |
+| INT8 picks the float model's class | 96.64% of test images |
+| RTL vs golden model, 10,000 images | 0 mismatches |
+| Weights | 34.4 KB |
+| Clock cycles per inference | 447,318 |
+
+```bash
+python tools/compile.py examples/cifar10.onnx --out build/cifar10 --data cifar10
+make sim-full MEM=build/cifar10 N_FULL=1000
+```
+
+Quantization costs 0.6 points here, against 0.03 for LeNet-5 on MNIST. A third
+of the cycles go to the first layer, where the 3 colour channels are padded to
+8 and five of the eight multipliers are idle.
+
 What the compiler does:
 
 - **Imports** a chain of Conv, BatchNormalization (folded into the
@@ -97,11 +119,11 @@ Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
 
 | Metric | Value |
 |---|---|
-| Standard cells | 19,836 combinational + 1,521 flip-flops |
-| Logic area | 141,917 µm² (0.142 mm²), 27% of it sequential |
+| Standard cells | 19,987 combinational + 1,531 flip-flops |
+| Logic area | 142,457 µm² (0.142 mm²), 27% of it sequential |
 | Longest combinational path | 2.6 ns → roughly 380 MHz |
-| Time per inference at that clock | CNN ≈ 30 µs, MLP ≈ 17 µs |
-| Memory as configured | 671 kbit: weights 524 kbit, 2 × 66 kbit activations, 14 kbit parameters, 1 kbit layer table |
+| Time per inference at that clock | MNIST CNN ≈ 30 µs, LeNet-5 ≈ 0.54 ms, CIFAR-10 CNN ≈ 1.2 ms |
+| Memory as configured | 802 kbit: weights 524 kbit, 2 × 131 kbit activations, 14 kbit parameters, 1 kbit layer table |
 | Memory the CNN alone needs | 107 kbit: weights 66 kbit, 2 × 16 kbit activations, 7 kbit parameters, 1 kbit layer table |
 
 These are logic-synthesis estimates, not sign-off numbers: there is no
@@ -124,7 +146,8 @@ comparable.
 | 3. Convolution (window addressing, wider layer table) | 3.0 ns | 102,592 µm² | 7,389 | 47,072 |
 | 4. Post unit overlaps the next output | 3.0 ns | 108,403 µm² | 6,460 | 20,051 |
 | 5. Feed-forward post pipeline, back-to-back outputs | 2.6 ns | 142,011 µm² | 6,377 | 11,352 |
-| 6. Current: padding, max pooling, per-channel requantization | 2.6 ns | 141,917 µm² | 6,379 | 11,355 |
+| 6. Padding, max pooling, per-channel requantization | 2.6 ns | 141,917 µm² | 6,379 | 11,355 |
+| 7. Current: larger memories (2,048-word buffers, 256 parameter words) | 2.6 ns | 142,457 µm² | 6,379 | 11,355 |
 
 What each step changed in the RTL:
 
@@ -206,9 +229,12 @@ The build restricts block RAMs to 18-bit data. In the 36-bit single-port mode
 nextpnr reports hold violations on every such block, for every placement;
 whether those are real or a timing-model artifact is not established.
 
-The numbers are for the CNN-only memory configuration (1,024 weight words,
+The numbers are for the MNIST CNN's memory configuration (1,024 weight words,
 256-word activation buffers). The full configuration used for the ASIC
-estimate has not been placed and routed.
+estimate has not been placed and routed, and by a block count it would not
+fit this board: the default memories need about 48 of its 46 block RAMs. The
+CIFAR-10 network therefore does not run on the Tang Nano 20K as things stand;
+it would need memories sized to the network, or the board's SDRAM.
 
 ## Architecture
 
@@ -219,8 +245,8 @@ flowchart LR
     subgraph mem[Memories]
         wmem[(Weights<br/>8192 × 64 bit)]
         bmem[(Parameters<br/>256 × 54 bit)]
-        bufa[(Activation<br/>buffer A<br/>1024 × 64 bit)]
-        bufb[(Activation<br/>buffer B<br/>1024 × 64 bit)]
+        bufa[(Activation<br/>buffer A<br/>2048 × 64 bit)]
+        bufb[(Activation<br/>buffer B<br/>2048 × 64 bit)]
     end
 
     subgraph mac[MAC pipeline, once per 8 inputs]
@@ -303,7 +329,9 @@ outputs are written a word at a time, so their channel count is a multiple of
   integer reference model, memory-image export.
 - `model/onnx_io.py`, `tools/compile.py` — ONNX front end and command line.
 - `model/train.py` — numpy training of the built-in networks.
-- `examples/` — LeNet-5 trained in PyTorch, and its ONNX file.
+- `model/datasets.py` — MNIST and CIFAR-10 loaders.
+- `examples/` — LeNet-5 and a CIFAR-10 CNN trained in PyTorch, with their
+  ONNX files.
 - `tests/test_compiler.py` — compiler tests.
 - `tb/tb_nn_accel.sv` — self-checking testbench.
 - `fpga/` — Tang Nano 20K demo, UART, build script and gate-level simulation

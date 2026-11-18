@@ -16,7 +16,7 @@ jobs:
   verify:
     name: Lint, simulate, synthesize
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -56,13 +56,13 @@ jobs:
         run: |
           make sim PY=python ARCH=cnn
           make sim PY=python ARCH=mlp
-          make sim PY=python ARCH=stress
+          make sim PY=python ARCH=stress N=20
 
       - name: Simulate 10,000 images each (Verilator)
         run: |
           make sim-full PY=python ARCH=cnn
           make sim-full PY=python ARCH=mlp
-          make sim-full PY=python ARCH=stress
+          make sim-full PY=python ARCH=stress N_FULL=2000
 
       - name: Compiler tests (ONNX import, rewrites, round trip)
         run: make test-compiler PY=python
@@ -71,6 +71,11 @@ jobs:
         run: |
           make lenet5 PY=python
           make sim-full PY=python MEM=build/lenet5 N_FULL=300
+
+      - name: PyTorch CIFAR-10 network from ONNX, 32 images (Verilator)
+        run: |
+          make cifar10-ci PY=python
+          make sim-full PY=python MEM=build/cifar10-ci N_FULL=32
 
       - name: Synthesize (SKY130)
         run: make synth

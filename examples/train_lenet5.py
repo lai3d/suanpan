@@ -19,7 +19,7 @@ from torch import nn
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "model"))
-from train import load_mnist  # noqa: E402
+from datasets import load_mnist  # noqa: E402
 
 
 class LeNet5(nn.Module):
@@ -42,9 +42,9 @@ def main():
     torch.manual_seed(0)
     d = load_mnist()
     def images(a):
-        return torch.tensor((a >> 1).astype(np.float32) / 127.0).reshape(-1, 1, 28, 28)
-    xtr, ytr = images(d["train_x"]), torch.tensor(d["train_y"].astype(np.int64))
-    xte, yte = images(d["test_x"]), torch.tensor(d["test_y"].astype(np.int64))
+        return torch.tensor((a >> 1).astype(np.float32) / 127.0)
+    xtr, ytr = images(d["train_x"]), torch.tensor(d["train_y"])
+    xte, yte = images(d["test_x"]), torch.tensor(d["test_y"])
 
     model = LeNet5()
     opt = torch.optim.Adam(model.parameters(), lr=2e-3)

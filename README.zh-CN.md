@@ -48,6 +48,24 @@ make sim-full MEM=build/lenet5
 | 权重 | 63.8 KB |
 | 每次推理的时钟周期数 | 205,247 |
 
+`examples/cifar10.onnx` 是一个面向 CIFAR-10 的小型 CNN，同样用 PyTorch 训练（`examples/train_cifar10.py`）：彩色图像、批归一化、三层带填充的卷积。
+
+| 来自 PyTorch 的 CIFAR-10 CNN | |
+|---|---|
+| 结构 | (conv 3×3 填充 1 → BN → ReLU → pool) × 3，通道数 16 / 32 / 64 → fc 10 |
+| 准确率，浮点 / INT8 | 81.13% / 80.54% |
+| INT8 与浮点模型选出同一类别 | 测试图的 96.64% |
+| RTL 对比黄金模型，10,000 张图 | 0 处不一致 |
+| 权重 | 34.4 KB |
+| 每次推理的时钟周期数 | 447,318 |
+
+```bash
+python tools/compile.py examples/cifar10.onnx --out build/cifar10 --data cifar10
+make sim-full MEM=build/cifar10 N_FULL=1000
+```
+
+量化在这里损失了 0.6 个百分点，而 MNIST 上的 LeNet-5 只损失 0.03。三分之一的周期花在第一层：3 个颜色通道被补齐到 8 个，8 个乘法器里有 5 个在空转。
+
 编译器做的事：
 
 - **导入**由 Conv、BatchNormalization（折叠进卷积）、Relu、MaxPool、Flatten 和 Gemm（或 MatMul 加 Add）串成的一条链。
@@ -66,11 +84,11 @@ make sim-full MEM=build/lenet5
 
 | 指标 | 数值 |
 |---|---|
-| 标准单元 | 19,836 个组合单元 + 1,521 个触发器 |
-| 逻辑面积 | 141,917 µm²（0.142 mm²），其中 27% 是时序单元 |
+| 标准单元 | 19,987 个组合单元 + 1,531 个触发器 |
+| 逻辑面积 | 142,457 µm²（0.142 mm²），其中 27% 是时序单元 |
 | 最长组合路径 | 2.6 ns，约 380 MHz |
-| 按此主频的单次推理时间 | CNN 约 30 µs，MLP 约 17 µs |
-| 当前配置的存储 | 671 kbit：权重 524 kbit，激活缓冲 2 × 66 kbit，参数 14 kbit，层配置表 1 kbit |
+| 按此主频的单次推理时间 | MNIST CNN 约 30 µs，LeNet-5 约 0.54 ms，CIFAR-10 CNN 约 1.2 ms |
+| 当前配置的存储 | 802 kbit：权重 524 kbit，激活缓冲 2 × 131 kbit，参数 14 kbit，层配置表 1 kbit |
 | 只跑 CNN 所需的存储 | 107 kbit：权重 66 kbit，激活缓冲 2 × 16 kbit，参数 7 kbit，层配置表 1 kbit |
 
 这些是逻辑综合阶段的估算，不是签核数据：还没有布局、布线、时钟树和 SRAM 宏（真实主频很可能由 SRAM 的读取时间决定），功耗也没有评估。主导芯片面积的会是存储器，而且差距很大，不是逻辑。
@@ -88,7 +106,8 @@ make sim-full MEM=build/lenet5
 | 3. 卷积（窗口寻址，更宽的层配置表） | 3.0 ns | 102,592 µm² | 7,389 | 47,072 |
 | 4. 后处理单元与下一个输出并行 | 3.0 ns | 108,403 µm² | 6,460 | 20,051 |
 | 5. 前馈的后处理流水线，输出背靠背发出 | 2.6 ns | 142,011 µm² | 6,377 | 11,352 |
-| 6. 当前：填充、最大池化、每通道重量化 | 2.6 ns | 141,917 µm² | 6,379 | 11,355 |
+| 6. 填充、最大池化、每通道重量化 | 2.6 ns | 141,917 µm² | 6,379 | 11,355 |
+| 7. 当前：更大的存储（2,048 字的缓冲，256 个参数字） | 2.6 ns | 142,457 µm² | 6,379 | 11,355 |
 
 每一步在 RTL 上改了什么：
 
@@ -134,7 +153,7 @@ make sim-full MEM=build/lenet5
 
 构建时把块 RAM 限制在 18 位数据宽度。用 36 位单端口模式时，nextpnr 会对每一块这样的 RAM 报保持时间违例，而且与布局无关；这些违例是真实存在还是时序模型的问题，目前没有定论。
 
-以上数字对应只跑 CNN 的存储配置（1,024 个权重字，256 字的激活缓冲）。ASIC 估算用的完整配置还没有做过布局布线。
+以上数字对应 MNIST CNN 的存储配置（1,024 个权重字，256 字的激活缓冲）。ASIC 估算用的完整配置还没有做过布局布线，而且按块数估算它在这块板子上装不下：默认的存储需要大约 48 块块 RAM，板子只有 46 块。所以 CIFAR-10 网络目前还不能在 Tang Nano 20K 上运行，需要把存储按网络实际大小来配，或者用上板载的 SDRAM。
 
 ## 架构
 
@@ -145,8 +164,8 @@ flowchart LR
     subgraph mem[存储器]
         wmem[(权重<br/>8192 × 64 位)]
         bmem[(参数<br/>256 × 54 位)]
-        bufa[(激活缓冲 A<br/>1024 × 64 位)]
-        bufb[(激活缓冲 B<br/>1024 × 64 位)]
+        bufa[(激活缓冲 A<br/>2048 × 64 位)]
+        bufb[(激活缓冲 B<br/>2048 × 64 位)]
     end
 
     subgraph mac[MAC 流水线，每 8 个输入一次]
@@ -207,7 +226,8 @@ flowchart LR
 - `model/nnc.py`：编译器核心，包括改写、量化、逐位一致的整数参考模型和存储镜像导出。
 - `model/onnx_io.py`、`tools/compile.py`：ONNX 前端和命令行。
 - `model/train.py`：用 numpy 训练内置的几个网络。
-- `examples/`：用 PyTorch 训练的 LeNet-5 及其 ONNX 文件。
+- `model/datasets.py`：MNIST 和 CIFAR-10 的加载。
+- `examples/`：用 PyTorch 训练的 LeNet-5 和 CIFAR-10 CNN，以及它们的 ONNX 文件。
 - `tests/test_compiler.py`：编译器的测试。
 - `tb/tb_nn_accel.sv`：自检测试平台。
 - `fpga/`：Tang Nano 20K 演示工程、串口、构建脚本和门级仿真模型。
