@@ -18,6 +18,10 @@ module tb_nn_accel;
     logic [6:0]         in_addr = 0;
     logic [63:0]        in_data = 0;
     logic               start = 0;
+    logic               cfg_we = 0;
+    logic [1:0]         cfg_addr = 0;
+    logic [79:0]        cfg_data = 0;
+    logic [79:0]        cfg_rom [0:1];
     logic               busy, done, logit_valid;
     logic [7:0]         class_idx, logit_idx;
     logic signed [31:0] logit_data;
@@ -25,10 +29,9 @@ module tb_nn_accel;
     nn_accel #(
         .P(P),
         .W_FILE("build/mem/weights.hex"),
-        .B_FILE("build/mem/bias.hex"),
-        .CFG_FILE("build/mem/cfg.hex")
+        .B_FILE("build/mem/bias.hex")
     ) dut (
-        .clk, .rst_n, .in_we, .in_addr, .in_data,
+        .clk, .rst_n, .cfg_we, .cfg_addr, .cfg_data, .in_we, .in_addr, .in_data,
         .start, .num_layers(3'd2), .busy, .done, .class_idx,
         .logit_valid, .logit_idx, .logit_data
     );
@@ -61,6 +64,7 @@ module tb_nn_accel;
             $dumpfile("build/tb.vcd");
             $dumpvars(0, tb_nn_accel);
         end
+        $readmemh("build/mem/cfg.hex", cfg_rom);
         $readmemh("build/mem/images.hex", images);
         $readmemh("build/mem/labels.hex", labels);
         $readmemh("build/mem/golden_class.hex", g_class);
@@ -69,6 +73,16 @@ module tb_nn_accel;
 
         repeat (4) @(posedge clk);
         rst_n <= 1;
+        @(posedge clk);
+
+        // program the layer table
+        for (int l = 0; l < 2; l++) begin
+            cfg_we   <= 1;
+            cfg_addr <= l[1:0];
+            cfg_data <= cfg_rom[l];
+            @(posedge clk);
+        end
+        cfg_we <= 0;
         @(posedge clk);
 
         for (img = 0; img < n; img++) begin
