@@ -67,6 +67,14 @@ module nn_accel #(
     parameter int A_AW       = 11,   // activation buffer address bits (words)
     parameter int B_AW       = 8,    // parameter memory address bits
     parameter int MAX_LAYERS = 8,
+    // Memory depths in words; 0 means the full 2^AW. A design built for one
+    // network can use the exact sizes the compiler reports (net_params.vh).
+    // Buffer A holds the input and the outputs of odd layers, buffer B the
+    // outputs of even layers, so the two rarely need the same depth.
+    parameter int W_DEPTH    = 0,
+    parameter int BUFA_DEPTH = 0,
+    parameter int BUFB_DEPTH = 0,
+    parameter int B_DEPTH    = 0,
     // optional $readmemh images for the weight and parameter memories (ROM use)
     parameter     W_FILE     = "",
     parameter     B_FILE     = ""
@@ -98,6 +106,10 @@ module nn_accel #(
 );
     localparam int LP = $clog2(P);
     localparam int LW = $clog2(MAX_LAYERS);
+    localparam int W_WORDS = (W_DEPTH != 0) ? W_DEPTH    : (1 << W_AW);
+    localparam int A_WORDS = (BUFA_DEPTH != 0) ? BUFA_DEPTH : (1 << A_AW);
+    localparam int C_WORDS = (BUFB_DEPTH != 0) ? BUFB_DEPTH : (1 << A_AW);
+    localparam int B_WORDS = (B_DEPTH != 0) ? B_DEPTH    : (1 << B_AW);
 
     // front end: walks layers, output pixels and kernel windows
     typedef enum logic [2:0] {
@@ -180,10 +192,10 @@ module nn_accel #(
     logic [A_AW-1:0] dst_addr;
     logic [P*8-1:0] dst_data;
 
-    sram_sp #(.DW(P*8), .AW(W_AW), .FILE(W_FILE)) u_wmem (
+    sram_sp #(.DW(P*8), .AW(W_AW), .DEPTH(W_WORDS), .FILE(W_FILE)) u_wmem (
         .clk, .we(1'b0), .addr(w_ptr), .wdata('0), .rdata(w_q));
 
-    sram_sp #(.DW(54), .AW(B_AW), .FILE(B_FILE)) u_bmem (
+    sram_sp #(.DW(54), .AW(B_AW), .DEPTH(B_WORDS), .FILE(B_FILE)) u_bmem (
         .clk, .we(1'b0), .addr(b_ptr), .wdata('0), .rdata(b_q));
 
     logic            bufa_we, bufb_we;
@@ -193,10 +205,10 @@ module nn_accel #(
     assign bufa_addr = in_we ? in_addr : (dst_we & src_sel) ? dst_addr : a_ptr;
     assign bufb_addr = bufb_we ? dst_addr : a_ptr;
 
-    sram_sp #(.DW(P*8), .AW(A_AW)) u_bufa (
+    sram_sp #(.DW(P*8), .AW(A_AW), .DEPTH(A_WORDS)) u_bufa (
         .clk, .we(bufa_we), .addr(bufa_addr),
         .wdata(in_we ? in_data : dst_data), .rdata(bufa_q));
-    sram_sp #(.DW(P*8), .AW(A_AW)) u_bufb (
+    sram_sp #(.DW(P*8), .AW(A_AW), .DEPTH(C_WORDS)) u_bufb (
         .clk, .we(bufb_we), .addr(bufb_addr), .wdata(dst_data), .rdata(bufb_q));
 
     assign a_q = src_sel ? bufb_q : bufa_q;

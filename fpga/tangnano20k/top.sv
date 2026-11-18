@@ -1,11 +1,11 @@
-// Tang Nano 20K demo: an MNIST classifier with LED output and a UART host
-// interface.
+// Tang Nano 20K demo: an image classifier with LED output and a UART host
+// interface. The network is whichever one the compiler's net_params.vh
+// describes; the memories are sized to it.
 //
 // After power-on (or any press/release of button S1) the wrapper
 //   1. writes the layer table into the accelerator,
 //   2. copies the demo image from ROM into activation buffer A. The ROM
-//      already holds it as input words in the network's own layout
-//      (space-to-depth, 14x14 pixels of 4 channels, one word each),
+//      already holds it as input words in the network's own layout,
 //   3. starts inference and waits for `done`.
 //
 // LEDs are active low:
@@ -16,23 +16,16 @@
 // UART (8N1, through the board's USB bridge). Commands are accepted only
 // while idle, one at a time:
 //   'P'                         -> 'K'                       (ping)
-//   'I' + IN_WORDS*8 bytes      -> class (1 byte) + N_OUT logits
+//   'I' + NET_IN_WORDS*8 bytes  -> class (1 byte) + NET_N_OUT logits
 //         input words, each 8 bytes little-endian;   logits are int32,
 //         i.e. the image in buffer A's layout        little-endian
 // If an image stalls for RX_TIMEOUT cycles the command is dropped, so a lost
 // byte cannot leave the receiver out of step for good.
 //
-// The network is the default CNN; memory images come from `make model`.
+// Build with the network's output directory on the include path, e.g.
+// -Ibuild/cnn; the memory images named in net_params.vh are read at synthesis
+// time, relative to the repo root.
 module top #(
-    // Memory images, read at synthesis time (paths relative to the repo root).
-    parameter     W_FILE    = "build/cnn/weights.hex",
-    parameter     B_FILE    = "build/cnn/params.hex",
-    parameter     CFG_FILE  = "build/cnn/cfg.hex",
-    parameter     IMG_FILE  = "build/cnn/demo_image.hex",
-    parameter int N_LAYERS  = 3,
-    parameter int IN_WORDS  = 196,
-    parameter int N_OUT     = 10,
-    parameter int A_AW      = 8,        // activation buffers: 2^A_AW words
     parameter int POR_BITS  = 16,       // power-on reset length (2^POR_BITS cycles)
     parameter int CLKS_PER_BIT = 234,   // 27 MHz / 115200 baud
     parameter int RX_TIMEOUT   = 3375000  // 125 ms at 27 MHz
@@ -43,6 +36,12 @@ module top #(
     output logic       uart_tx,
     output logic [5:0] led
 );
+    `include "net_params.vh"
+    localparam int N_LAYERS = NET_LAYERS;
+    localparam int IN_WORDS = NET_IN_WORDS;
+    localparam int N_OUT    = NET_N_OUT;
+    localparam int A_AW     = NET_A_AW;
+
     // ------------------------------------------------- reset and re-run
     logic [POR_BITS:0] por = '0;
     logic              rst_n;
@@ -86,10 +85,10 @@ module top #(
 
     // ------------------------------------------------------------ ROMs
     logic [175:0] cfg_rom [0:7];
-    logic [63:0]  img_rom [0:(1<<A_AW)-1];
+    logic [63:0]  img_rom [0:IN_WORDS-1];
     initial begin
-        $readmemh(CFG_FILE, cfg_rom);
-        $readmemh(IMG_FILE, img_rom);
+        $readmemh(NET_CFG_FILE, cfg_rom);
+        $readmemh(NET_DEMO_IMAGE_FILE, img_rom);
     end
 
     // ----------------------------------------------------- accelerator
@@ -102,9 +101,11 @@ module top #(
     logic signed [31:0] logit_data;
 
     nn_accel #(
-        .W_AW(10), .A_AW(A_AW),
-        .W_FILE(W_FILE),
-        .B_FILE(B_FILE)
+        .W_AW(NET_W_AW), .A_AW(A_AW), .B_AW(NET_P_AW),
+        .W_DEPTH(NET_W_WORDS), .BUFA_DEPTH(NET_A_WORDS), .BUFB_DEPTH(NET_B_WORDS),
+        .B_DEPTH(NET_P_WORDS),
+        .W_FILE(NET_WEIGHTS_FILE),
+        .B_FILE(NET_PARAMS_FILE)
     ) u_accel (
         .clk, .rst_n, .cfg_we, .cfg_addr, .cfg_data, .in_we, .in_addr, .in_data,
         .start, .num_layers(4'(N_LAYERS)), .busy, .done, .class_idx,
@@ -120,7 +121,7 @@ module top #(
         T_CFG, T_IMG, T_START, T_WAIT, T_REPLY, T_IDLE, T_RX, T_PONG
     } tstate_t;
     tstate_t     tstate;
-    logic [10:0] cnt;          // layer index, then input word index
+    logic [11:0] cnt;          // layer index, then input word index
     logic [63:0] pixel;        // synchronous ROM read
     logic        pixel_v;
     logic [A_AW-1:0] pixel_addr;
@@ -154,7 +155,7 @@ module top #(
         if (rcnt == '0) rbyte = {4'd0, result};
     end
 
-    always_ff @(posedge clk) pixel <= img_rom[cnt[A_AW-1:0]];
+    always_ff @(posedge clk) pixel <= img_rom[cnt[$clog2(IN_WORDS)-1:0]];
 
     assign cfg_data = cfg_rom[cnt[2:0]];
     assign cfg_addr = cnt[2:0];
@@ -190,7 +191,7 @@ module top #(
 
             case (tstate)
                 T_CFG: begin
-                    if (cnt == 11'(N_LAYERS - 1)) begin
+                    if (cnt == 12'(N_LAYERS - 1)) begin
                         cnt    <= '0;
                         tstate <= T_IMG;
                     end else begin
@@ -199,7 +200,7 @@ module top #(
                 end
 
                 T_IMG: begin
-                    if (cnt == 11'(IN_WORDS - 1)) begin
+                    if (cnt == 12'(IN_WORDS - 1)) begin
                         cnt    <= '0;
                         tstate <= T_START;
                     end else begin
@@ -255,7 +256,7 @@ module top #(
                             uw_addr <= cnt[A_AW-1:0];
                             uw_data <= {rx_data, wsh[63:8]};
                             cnt     <= cnt + 1'b1;
-                            if (cnt == 11'(IN_WORDS - 1)) tstate <= T_START;
+                            if (cnt == 12'(IN_WORDS - 1)) tstate <= T_START;
                         end
                     end else if (tcnt == ($bits(tcnt))'(RX_TIMEOUT)) begin
                         tstate <= T_IDLE;                // stalled: drop the command

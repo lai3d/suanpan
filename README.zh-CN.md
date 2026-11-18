@@ -124,17 +124,25 @@ make sim-full MEM=build/cifar10 N_FULL=1000
 
 ## FPGA（层次 2，进行中）
 
-`fpga/tangnano20k` 是面向 Sipeed Tang Nano 20K（高云 GW2AR-18）的独立演示工程：上电后把 ROM 里的一张 MNIST 数字图送进加速器，运行 CNN，把识别结果显示在 LED 上。按一下按键会重新运行。主机还可以通过板载的 USB 串口发送任意图像，取回分类结果和全部 10 个 logit，这样就能在真实硬件上做和仿真测试平台一样的逐位比对。
+`fpga/tangnano20k` 是面向 Sipeed Tang Nano 20K（高云 GW2AR-18）的独立演示工程：上电后把 ROM 里的一张测试图送进加速器，运行网络，把识别结果显示在 LED 上。按一下按键会重新运行。主机还可以通过板载的 USB 串口发送任意图像，取回分类结果和全部 10 个 logit，这样就能在真实硬件上做和仿真测试平台一样的逐位比对。
 
-它用开源流程构建（Yosys、nextpnr-himbaechel、gowin_pack）：
+这个设计是围绕一个编译好的网络来构建的。编译器会写出一个小的头文件（`net_params.vh`），里面是该网络各个存储器的精确大小；存储器就做成这么深，不多也不少，而不是向上取到 2 的幂：
 
-| 指标 | 数值 |
-|---|---|
-| 时序 | 可达 85 MHz，要求 27 MHz（板载晶振） |
-| LUT4 | 2,770 / 20,736（13%） |
-| 触发器 | 2,166 / 15,552（14%） |
-| 块 RAM | 17 / 46（37%） |
-| DSP 乘法器 | 8 个 9×9，4 个 18×18 |
+```bash
+make fpga                       # 默认的 MNIST CNN
+make fpga NET=build/cifar10     # 任意一个编译好的网络
+```
+
+三个示例网络用开源流程（Yosys、nextpnr-himbaechel、gowin_pack）都能装进这块板子：
+
+| | MNIST CNN | LeNet-5 | CIFAR-10 CNN |
+|---|---|---|---|
+| 块 RAM（共 46 块） | 14 | 41 | 35 |
+| LUT4（共 20,736 个） | 2,787 | 3,041 | 3,056 |
+| 时序（要求 27 MHz） | 82 MHz | 82 MHz | 81 MHz |
+| 布线后网表的门级仿真 | 通过 | 未运行 | 通过 |
+
+按实际大小配置是有意义的：存储器如果取 2 的幂，CIFAR-10 网络大约需要 48 块块 RAM，装不下。
 
 哪些验证过，哪些没有：
 
@@ -152,8 +160,6 @@ make sim-full MEM=build/cifar10 N_FULL=1000
 一条命令如果停顿超过 125 毫秒就会被丢弃，所以丢一个字节不会让链路一直错位。
 
 构建时把块 RAM 限制在 18 位数据宽度。用 36 位单端口模式时，nextpnr 会对每一块这样的 RAM 报保持时间违例，而且与布局无关；这些违例是真实存在还是时序模型的问题，目前没有定论。
-
-以上数字对应 MNIST CNN 的存储配置（1,024 个权重字，256 字的激活缓冲）。ASIC 估算用的完整配置还没有做过布局布线，而且按块数估算它在这块板子上装不下：默认的存储需要大约 48 块块 RAM，板子只有 46 块。所以 CIFAR-10 网络目前还不能在 Tang Nano 20K 上运行，需要把存储按网络实际大小来配，或者用上板载的 SDRAM。
 
 ## 架构
 
@@ -248,6 +254,7 @@ make test-compiler
 
 make fpga-sim      # Tang Nano 20K 顶层，RTL 仿真
 make fpga          # 综合、布局布线，生成 build/fpga/top.fs
+                   # （NET=<编译好的网络目录>，默认 build/cnn）
 make fpga-gatesim  # 对布线后的网表做仿真
 make fpga-load     # 把比特流载入 SRAM（断电丢失）
 make fpga-flash    # 把比特流写入板上的闪存

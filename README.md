@@ -185,21 +185,33 @@ and uses a delay-oriented ABC script (`syn/abc.script`).
 ## FPGA (stage 2, in progress)
 
 `fpga/tangnano20k` is a self-contained demo for the Sipeed Tang Nano 20K
-(Gowin GW2AR-18): on power-up it loads one MNIST digit from ROM into the
-accelerator, runs the CNN, and shows the predicted class on the LEDs. A button
-press runs it again. Over the board's USB serial port a host can also send any
-image and get back the class and all ten logits, which allows the same
-bit-exact comparison on hardware that the testbench makes in simulation.
+(Gowin GW2AR-18): on power-up it loads one test image from ROM into the
+accelerator, runs the network, and shows the predicted class on the LEDs. A
+button press runs it again. Over the board's USB serial port a host can also
+send any image and get back the class and all ten logits, which allows the
+same bit-exact comparison on hardware that the testbench makes in simulation.
 
-It builds with the open-source flow (Yosys, nextpnr-himbaechel, gowin_pack):
+The design is built around one compiled network. The compiler writes a small
+header (`net_params.vh`) with that network's exact memory sizes, and the
+memories are made that deep and no deeper, instead of the next power of two:
 
-| Metric | Value |
-|---|---|
-| Timing | 85 MHz achievable, 27 MHz required (board oscillator) |
-| LUT4 | 2,770 of 20,736 (13%) |
-| Flip-flops | 2,166 of 15,552 (14%) |
-| Block RAM | 17 of 46 (37%) |
-| DSP multipliers | 8 × 9×9 and 4 × 18×18 |
+```bash
+make fpga                       # the default MNIST CNN
+make fpga NET=build/cifar10     # any compiled network
+```
+
+All three example networks fit the board with the open-source flow (Yosys,
+nextpnr-himbaechel, gowin_pack):
+
+| | MNIST CNN | LeNet-5 | CIFAR-10 CNN |
+|---|---|---|---|
+| Block RAM (of 46) | 14 | 41 | 35 |
+| LUT4 (of 20,736) | 2,787 | 3,041 | 3,056 |
+| Timing (27 MHz required) | 82 MHz | 82 MHz | 81 MHz |
+| Routed netlist in gate-level simulation | pass | not run | pass |
+
+Sizing matters: with power-of-two memories the CIFAR-10 network needs about
+48 block RAMs and does not fit.
 
 What has and has not been checked:
 
@@ -228,13 +240,6 @@ link out of step.
 The build restricts block RAMs to 18-bit data. In the 36-bit single-port mode
 nextpnr reports hold violations on every such block, for every placement;
 whether those are real or a timing-model artifact is not established.
-
-The numbers are for the MNIST CNN's memory configuration (1,024 weight words,
-256-word activation buffers). The full configuration used for the ASIC
-estimate has not been placed and routed, and by a block count it would not
-fit this board: the default memories need about 48 of its 46 block RAMs. The
-CIFAR-10 network therefore does not run on the Tang Nano 20K as things stand;
-it would need memories sized to the network, or the board's SDRAM.
 
 ## Architecture
 
@@ -354,6 +359,7 @@ make test-compiler
 
 make fpga-sim      # Tang Nano 20K wrapper, RTL simulation
 make fpga          # synthesis, place and route -> build/fpga/top.fs
+                   # (NET=<compiled network dir>, default build/cnn)
 make fpga-gatesim  # simulate the routed netlist
 make fpga-load     # load the bitstream into SRAM (lost at power-off)
 make fpga-flash    # write the bitstream to the board's flash

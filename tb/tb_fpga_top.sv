@@ -7,6 +7,9 @@
 //   stalled image   a truncated command is dropped and the link recovers
 //   button          re-runs the demo image
 //
+// Compile with the network's directory on the include path (-Ibuild/cnn):
+// net_params.vh says how big the images are and where the vectors live.
+//
 //   +N=<count>   images to send over UART (default 3; 0 in GATE mode)
 //   +CPB=<n>     clocks per UART bit; must match the design under test
 //
@@ -15,9 +18,10 @@
 // there because the real timeout is millions of cycles.
 `timescale 1ns/1ps
 module tb_fpga_top;
-    localparam int IN_WORDS = 196;
-    localparam int N_OUT    = 10;
-    localparam int MAX_N    = 64;
+    `include "net_params.vh"
+    localparam int IN_WORDS = NET_IN_WORDS;
+    localparam int N_OUT    = NET_N_OUT;
+    localparam int MAX_N    = 16;
 
     logic clk = 0, btn = 0, uart_rx = 1;
     logic uart_tx;
@@ -80,7 +84,7 @@ module tb_fpga_top;
         send_byte("I");
         for (int w = 0; w < IN_WORDS; w++)
             for (int k = 0; k < 8; k++) send_byte(images[idx*IN_WORDS + w][k*8 +: 8]);
-        recv_byte(cls, ok, 60000);
+        recv_byte(cls, ok, 2000000);
         if (!ok) begin $display("FAIL: image %0d: no reply", idx); errors++; return; end
         for (int o = 0; o < N_OUT; o++) begin
             for (int k = 0; k < 4; k++) begin
@@ -99,7 +103,7 @@ module tb_fpga_top;
 
     task automatic wait_result(input string what);
         int guard = 0;
-        while (led[5] !== 1'b0 && guard < 200000) begin @(posedge clk); guard++; end
+        while (led[5] !== 1'b0 && guard < 2000000) begin @(posedge clk); guard++; end
         if (led[5] !== 1'b0) begin
             $display("FAIL (%0s): no result after %0d cycles", what, guard);
             errors++;
@@ -119,9 +123,9 @@ module tb_fpga_top;
 `else
         if (!$value$plusargs("N=%d", n)) n = 3;
 `endif
-        $readmemh("build/cnn/images.hex", images);
-        $readmemh("build/cnn/golden_class.hex", g_class);
-        $readmemh("build/cnn/golden_logits.hex", g_logits);
+        $readmemh({NET_DIR, "/images.hex"}, images);
+        $readmemh({NET_DIR, "/golden_class.hex"}, g_class);
+        $readmemh({NET_DIR, "/golden_logits.hex"}, g_logits);
 
         wait_result("power-on");
         ping("after power-on");
