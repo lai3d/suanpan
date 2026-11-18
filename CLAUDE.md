@@ -19,8 +19,8 @@ make lint       # verilator --lint-only -Wall on the RTL
 make synth      # Yosys + ABC onto SKY130, PERIOD=<ps>
 ```
 
-- `ARCH=cnn` (default) or `ARCH=mlp` selects the network for `model`, `sim`, `sim-full` and `wave`. Each has its own `build/<arch>/` directory.
-- The quickest check after an RTL change is `make sim N=5`. Before finishing, run `make lint` and `make sim-full` for **both** `ARCH=cnn` and `ARCH=mlp`; CI does exactly this. The MLP exercises the fully-connected path as a degenerate convolution, so it catches different bugs.
+- `ARCH=cnn` (default), `ARCH=mlp` or `ARCH=stress` selects the network for `model`, `sim`, `sim-full` and `wave`. Each has its own `build/<arch>/` directory.
+- The quickest check after an RTL change is `make sim N=5`. Before finishing, run `make lint` and `make sim-full` for `ARCH=cnn`, `ARCH=mlp` and `ARCH=stress`; CI runs all three. The MLP exercises the fully-connected path as a degenerate convolution. `stress` is not a useful network: it exists to hit hardware corner cases (a hidden layer with one-word windows, which forces the front end to wait for the post unit, and a layer width that is not a multiple of 8). If you add a corner case to the RTL, extend `stress` to reach it.
 - `sim` and `sim-full` exit non-zero unless the testbench prints `RESULT: PASS`.
 - Verilator's generated makefile cannot build in a path containing spaces. If the checkout lives under one, pass `VOBJ=<dir without spaces>` to `make sim-full`.
 - `make model` downloads MNIST into `data/` on first run. `build/`, `data/` and `.venv/` are not committed.
@@ -43,13 +43,16 @@ The hardware is network-agnostic. A network is three memory images produced by `
 
 **The layer table is the contract between Python and RTL.** Each layer is one 144-bit descriptor. Its bit layout is defined twice and must stay in sync: `cfg_word()` in `model/train.py` and the header comment plus the `S_LOAD` state in `rtl/nn_accel.sv`. `compile_program()` in `train.py` is where a layer's geometry is turned into those fields and where weights are packed in the order the hardware reads them (per output channel: `ky`, `kx`, padded channel).
 
-**Control flow in `nn_accel.sv`.** One FSM runs per output value: `S_MAC` issues addresses, a 3-stage pipeline (`v1`/`v2`/`v3`: registered products, adder tree, accumulate) trails it, `S_DRAIN` waits for the pipeline to empty, then bias and a multi-cycle requantization (`S_MUL`…`S_CLAMP`) run before `S_OUT` writes the byte and advances the channel / pixel / row counters. Output bytes are assembled into a full word before being written. Two activation buffers ping-pong, selected by `layer[0]`.
+**Control flow in `nn_accel.sv`.** Two state machines run concurrently. The front end (`state`) issues addresses in `S_MAC` and, on the last word of an output, advances the channel / pixel / row counters and goes straight on to the next output. A 3-stage pipeline (`v1`/`v2`/`v3`: registered products, adder tree, accumulate) trails it, with `f*`/`l*` tags marking the first and last word of each output. The accumulator starts from the bias on the first word. When the last word reaches stage 3 (`handoff`), the sum moves to the post unit (`pstate`), which requantizes over several cycles (`P_MUL`…`P_CLAMP`) and writes the byte in `P_OUT`. Output bytes are assembled into a full word before being written. Two activation buffers ping-pong, selected by `layer[0]`.
+
+Two timing rules hold this together. The post unit is busy for 9 cycles, so `S_NEURON` holds off until `POST_GAP` cycles have passed since the previous output started (`cool`); this only bites when a window is shorter than 9 words. And the front end drains everything in flight (`S_DRAIN`) before changing layer, because the next layer reads the buffer the current one is still writing and the post unit uses the per-layer constants.
 
 **Memories are black boxes in synthesis.** `rtl/sram_sp.sv` is a behavioral synchronous-read memory standing in for SRAM macros. `syn/synth.sh` reads it with `-lib`, so reported area and timing cover logic only. The testbench loads weight and bias images by hierarchical reference (`dut.u_wmem.mem`).
 
 ## Things that are easy to get wrong
 
-- **Yosys adder mapping.** Yosys/ABC defaults map adders to ripple-carry chains, which hides the real critical path. `syn/synth.sh` deliberately maps to Kogge-Stone and uses `syn/abc.script`; keep that when changing the flow.
+- **Yosys adder mapping.** Yosys/ABC defaults are area-oriented and turn adders into ripple-carry chains, which hides the real critical path and makes timing jump between revisions for no RTL reason. `syn/synth.sh` deliberately maps to Kogge-Stone, passes `-noabc` to `synth`, and uses `syn/abc.script`; keep all three when changing the flow.
+- **Reading ABC's timing.** ABC's area recovery relaxes every path up to the slowest one, so the path `stime -p` prints is not necessarily the cause. When timing regresses, compare against `main` under the same flow before touching RTL.
 - **Shared adders are explicit on purpose.** `acc_y` (accumulate or bias) and `add_y` (Horner step or rounding) are each written as one adder with muxed operands. Writing them as separate `+` expressions in different FSM states makes Yosys merge them into a slower structure.
 - **Icarus is the stricter front end.** It rejects enum assignment through a ternary (`state <= c ? A : B`) and warns on variable part-selects inside `always_comb`; use `if/else` and per-lane loops as the existing code does. Code must build under both Icarus and Verilator.
 - **Layer constraints.** Valid convolutions only (no padding), no pooling, convolution output channels must be a multiple of 8, and one requantization scale per layer. `compile_program()` asserts the channel rule.
