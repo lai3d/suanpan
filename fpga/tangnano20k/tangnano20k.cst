@@ -18,3 +18,9 @@ IO_LOC  "led[4]" 19;
 IO_PORT "led[4]" PULL_MODE=UP DRIVE=8 IO_TYPE=LVCMOS33;
 IO_LOC  "led[5]" 20;
 IO_PORT "led[5]" PULL_MODE=UP DRIVE=8 IO_TYPE=LVCMOS33;
+
+// UART through the on-board USB bridge
+IO_LOC  "uart_tx" 69;
+IO_PORT "uart_tx" IO_TYPE=LVCMOS33;
+IO_LOC  "uart_rx" 70;
+IO_PORT "uart_rx" PULL_MODE=UP IO_TYPE=LVCMOS33;

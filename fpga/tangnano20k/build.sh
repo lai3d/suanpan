@@ -1,10 +1,13 @@
 #!/bin/sh
 # Build the Tang Nano 20K demo with the open-source Gowin flow.
-#   usage: fpga/tangnano20k/build.sh        (run from the repo root)
+#   usage: [BAUD=115200] [OUT=build/fpga] fpga/tangnano20k/build.sh
+#          (run from the repo root)
 # Needs yosys, nextpnr-himbaechel and gowin_pack on PATH (OSS CAD Suite),
 # and the CNN memory images from `make model`.
 set -e
-OUT=build/fpga
+OUT=${OUT:-build/fpga}
+BAUD=${BAUD:-115200}
+CLKS_PER_BIT=$((27000000 / BAUD))
 DEVICE=GW2AR-LV18QN88C8/I7
 FAMILY=GW2A-18C
 mkdir -p $OUT
@@ -18,7 +21,8 @@ sed 's/widths 1 2 4 9 18 36 per_port;/widths 1 2 4 9 18 per_port;/' \
     "$(yosys-config --datdir)/gowin/brams.txt" > $OUT/brams_no36.txt
 
 yosys -q -l $OUT/synth.log -p "
-    read_verilog -sv rtl/sram_sp.sv rtl/dot_unit.sv rtl/nn_accel.sv fpga/tangnano20k/top.sv
+    read_verilog -sv rtl/sram_sp.sv rtl/dot_unit.sv rtl/nn_accel.sv fpga/uart.sv fpga/tangnano20k/top.sv
+    chparam -set CLKS_PER_BIT $CLKS_PER_BIT top
     synth_gowin -top top -run :map_ram
     memory_libmap -lib +/gowin/lutrams.txt -lib $OUT/brams_no36.txt
     techmap -map +/gowin/lutrams_map.v -map +/gowin/brams_map.v
@@ -35,4 +39,5 @@ gowin_pack -d $FAMILY -o $OUT/top.fs $OUT/top_pnr.json 2>/dev/null
 
 grep -E "Max frequency" $OUT/pnr.log | tail -1 | sed 's/^Info: //'
 grep -E "(LUT4|DFF|BSRAM|MULT9X9|MULT18X18|RAM16SDP4|ALU):" $OUT/pnr.log | sed 's/^Info: *//'
+echo "UART: $BAUD baud ($CLKS_PER_BIT clocks per bit)"
 echo "bitstream: $OUT/top.fs"

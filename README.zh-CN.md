@@ -70,23 +70,32 @@ CNN 的输入按 space-to-depth 方式存放：每个 2×2 像素块变成一个
 
 ## FPGA（层次 2，进行中）
 
-`fpga/tangnano20k` 是面向 Sipeed Tang Nano 20K（高云 GW2AR-18）的独立演示工程：上电后把 ROM 里的一张 MNIST 数字图送进加速器，运行 CNN，把识别结果显示在 LED 上。按一下按键会重新运行。
+`fpga/tangnano20k` 是面向 Sipeed Tang Nano 20K（高云 GW2AR-18）的独立演示工程：上电后把 ROM 里的一张 MNIST 数字图送进加速器，运行 CNN，把识别结果显示在 LED 上。按一下按键会重新运行。主机还可以通过板载的 USB 串口发送任意图像，取回分类结果和全部 10 个 logit，这样就能在真实硬件上做和仿真测试平台一样的逐位比对。
 
 它用开源流程构建（Yosys、nextpnr-himbaechel、gowin_pack）：
 
 | 指标 | 数值 |
 |---|---|
-| 时序 | 可达 94 MHz，要求 27 MHz（板载晶振） |
-| LUT4 | 2,338 / 20,736（11%） |
-| 触发器 | 1,340 / 15,552（8%） |
+| 时序 | 可达 98 MHz，要求 27 MHz（板载晶振） |
+| LUT4 | 2,823 / 20,736（13%） |
+| 触发器 | 1,655 / 15,552（10%） |
 | 块 RAM | 14 / 46（30%） |
 | DSP 乘法器 | 8 个 9×9，4 个 18×18 |
 
 哪些验证过，哪些没有：
 
-- 板级顶层通过了 RTL 仿真（`make fpga-sim`）。
+- 板级顶层通过了 RTL 仿真（`make fpga-sim`）。测试平台扮演主机：发连通性测试，通过串口发送图像并核对分类结果和每一个 logit，还验证了中途停顿的命令会被丢弃。
 - 布局布线后的网表通过了门级仿真（`make fpga-gatesim`），用的是本仓库为高云块 RAM 和乘法器写的行为模型。这些模型遵循 Yosys 自身的映射约定，不是厂商模型。
-- **它还没有在实体开发板上运行过。** 引脚编号取自 Sipeed 的示例仓库；按键的电平极性没有核实，所以顶层做成了按键状态一变化就重跑。
+- **它还没有在实体开发板上运行过。** 引脚编号取自 Sipeed 的示例仓库；按键的电平极性没有核实，所以顶层做成了按键状态一变化就重跑。`tools/host.py` 只在没有开发板的情况下运行过。
+
+串口协议（8N1，默认 115200 波特率；用 `BAUD=<波特率> make fpga` 修改）：
+
+| 主机发送 | 开发板回复 |
+|---|---|
+| `P` | `K` |
+| `I` + 196 个输入字，每个 8 字节，小端 | 分类结果（1 字节）+ 10 个 logit，int32 小端 |
+
+一条命令如果停顿超过 125 毫秒就会被丢弃，所以丢一个字节不会让链路一直错位。
 
 构建时把块 RAM 限制在 18 位数据宽度。用 36 位单端口模式时，nextpnr 会对每一块这样的 RAM 报保持时间违例，而且与布局无关；这些违例是真实存在还是时序模型的问题，目前没有定论。
 
@@ -154,7 +163,8 @@ flowchart LR
 - `rtl/sram_sp.sv`：同步读存储器（对应 SRAM 宏或块 RAM）。
 - `model/train.py`：numpy 训练、量化、存储镜像导出，以及逐位一致的整数参考模型。
 - `tb/tb_nn_accel.sv`：自检测试平台。
-- `fpga/`：Tang Nano 20K 演示工程、构建脚本和门级仿真模型。
+- `fpga/`：Tang Nano 20K 演示工程、串口、构建脚本和门级仿真模型。
+- `tools/host.py`：串口接口的主机端。
 
 ## 运行
 
@@ -171,6 +181,11 @@ make synth      # SKY130 逻辑综合（需要 yosys），PERIOD=<皮秒>
 make fpga-sim      # Tang Nano 20K 顶层，RTL 仿真
 make fpga          # 综合、布局布线，生成 build/fpga/top.fs
 make fpga-gatesim  # 对布线后的网表做仿真
+make fpga-load     # 把比特流载入 SRAM（断电丢失）
+make fpga-flash    # 把比特流写入板上的闪存
+
+python tools/host.py --port <串口设备> ping
+python tools/host.py --port <串口设备> run --n 10000
 ```
 
 `fpga` 相关目标需要 `PATH` 里有 `nextpnr-himbaechel` 和 `gowin_pack`，[OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build) 里两个都有。
