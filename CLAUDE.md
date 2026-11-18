@@ -24,6 +24,7 @@ make cifar10-ci      # same network from the small .npz subsets in examples/
 
 make fpga-sim      # Tang Nano 20K wrapper in RTL simulation
 make fpga          # synth_gowin + nextpnr-himbaechel + gowin_pack -> build/fpga/top.fs
+                   # NET=build/<network> picks the compiled network (default build/cnn)
 make fpga-gatesim  # simulate the placed-and-routed netlist
 make fpga-load     # openFPGALoader, SRAM (volatile); fpga-flash writes flash
 ```
@@ -84,6 +85,9 @@ Things that follow from this design:
 - **Buffer sizes are parameters.** `A_AW`, `W_AW`, `B_AW` in `nn_accel.sv` bound the largest feature map, weight count and parameter count; `LIMITS` in `nnc.py` mirrors the defaults so the compiler can refuse networks that do not fit. The testbench has its own `A_AW` and `MAX_*` limits that must cover the network being run.
 
 ## FPGA flow
+
+- **The FPGA design is built around one compiled network.** `nnc.export` writes `net_params.vh` into the network's directory: exact memory depths, address widths, and the paths of the memory images. `fpga/tangnano20k/top.sv` and `tb/tb_fpga_top.sv` `` `include `` it, so the network directory must be on the include path (`-I`); the Makefile and scripts do this from `NET`. Nothing about a particular network belongs in `top.sv`.
+- **Memories are sized exactly on the FPGA, and to 2^AW elsewhere.** `nn_accel` takes `W_DEPTH`, `BUFA_DEPTH`, `BUFB_DEPTH`, `B_DEPTH` (0 = full). Buffer A holds the input and odd layers' outputs, buffer B even layers' outputs, so they differ. Addresses at or above a depth are never written; padded layers do read there, and those words are zeroed at stage 0, so do not add logic that uses `a_q` before the mask.
 
 - **A failing gate-level simulation is not automatically a design bug.** Yosys' Gowin simulation library declares the block RAM (`SPX9`) and the multipliers as black boxes, so their outputs are X. `fpga/gowin_sim.v` holds behavioural models written from Yosys' own mapping files (`brams_map.v`, `dsp_map.v`), and `fpga/gatesim.sh` swaps them in. If synthesis starts using a cell that has no model there, the symptom is X on the outputs with a correct cycle count.
 - **Partially initialized ROMs look uninitialized in a dump.** Yosys prints `INIT` MSB-first, so a ROM whose upper addresses are unused starts with a long run of `x`. Count defined bits before concluding a `$readmemh` did not load.

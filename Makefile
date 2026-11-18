@@ -70,20 +70,24 @@ cifar10-ci:
 
 # --- Tang Nano 20K demo (needs the OSS CAD Suite on PATH) -----------------
 FPGA_TOP := fpga/uart.sv fpga/tangnano20k/top.sv
+# Compiled network the FPGA design is built around; its net_params.vh sizes
+# the memories. E.g. `make fpga NET=build/cifar10`.
+NET ?= build/cnn
+FPGA_N ?= 3
 
 # RTL simulation of the board wrapper: the LEDs must show the golden class.
-fpga-sim: build/cnn/weights.hex
-	iverilog -g2012 -o build/tb_fpga.vvp $(RTL) $(FPGA_TOP) tb/tb_fpga_top.sv
-	vvp -n build/tb_fpga.vvp | tee build/fpga-sim.log
+fpga-sim: $(NET)/net_params.vh
+	iverilog -g2012 -I$(NET) -o build/tb_fpga.vvp $(RTL) $(FPGA_TOP) tb/tb_fpga_top.sv
+	vvp -n build/tb_fpga.vvp +N=$(FPGA_N) | tee build/fpga-sim.log
 	@grep -q "RESULT: PASS" build/fpga-sim.log
 
 # Synthesis, place and route, bitstream -> build/fpga/top.fs
-fpga: build/cnn/weights.hex
-	fpga/tangnano20k/build.sh
+fpga: $(NET)/net_params.vh
+	NET=$(NET) fpga/tangnano20k/build.sh
 
 # Simulate the exact netlist that was placed and routed.
 fpga-gatesim: fpga
-	fpga/gatesim.sh build/fpga/top_synth.v tb/tb_fpga_top.sv tb_fpga_top
+	NET=$(NET) fpga/gatesim.sh build/fpga/top_synth.v tb/tb_fpga_top.sv tb_fpga_top
 
 # Load the bitstream into the FPGA's SRAM (lost at power-off) ...
 fpga-load:
@@ -92,6 +96,8 @@ fpga-load:
 # ... or write it to the board's flash so it survives a power cycle.
 fpga-flash:
 	openFPGALoader -b tangnano20k -f build/fpga/top.fs
+
+build/cnn/net_params.vh: build/cnn/weights.hex
 
 clean:
 	rm -rf build

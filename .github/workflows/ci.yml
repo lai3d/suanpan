@@ -80,6 +80,9 @@ jobs:
       - name: Synthesize (SKY130)
         run: make synth
 
+      - name: FPGA build of the CIFAR-10 network (place and route only)
+        run: make fpga PY=python NET=build/cifar10-ci
+
       - name: FPGA wrapper, RTL simulation
         run: make fpga-sim PY=python
 
