@@ -1,5 +1,7 @@
 # suanpan (算盘)
 
+[中文版](README.zh-CN.md)
+
 [![CI](https://github.com/lai3d/suanpan/actions/workflows/ci.yml/badge.svg)](https://github.com/lai3d/suanpan/actions/workflows/ci.yml)
 
 An AI chip designed from scratch, one stage at a time. The name is the Chinese
@@ -19,23 +21,27 @@ Two networks run on the same hardware; only the memory images differ.
 
 | | CNN (default) | MLP |
 |---|---|---|
-| Layers | conv 3×3/2 ×8 → conv 3×3/2 ×16 → fc 10 | fc 64 → fc 10 |
-| Accuracy, float / INT8 | 98.51% / 98.48% | 97.52% / 97.48% |
-| Weights | 7.5 KB | 50.8 KB |
+| Layers | conv 4×4/2 ×8 → conv 3×3/2 ×16 → fc 10 | fc 64 → fc 10 |
+| Accuracy, float / INT8 | 98.61% / 98.59% | 97.52% / 97.48% |
+| Weights | 7.2 KB | 50.8 KB |
 | RTL vs golden model, 10,000 images | 0 mismatches | 0 mismatches |
-| Clock cycles per inference | 20,051 | 6,460 |
+| Clock cycles per inference | 11,352 | 6,377 |
 
 Accuracy is on the 10,000-image MNIST test set, post-training quantization.
 "0 mismatches" means all 100,000 logits and 10,000 predicted classes match.
 A third network, `stress`, exists only to exercise hardware corner cases
-(one-word windows, odd layer widths) and is checked the same way.
+(one-word windows, a padded single-channel input, odd layer widths) and is
+checked the same way.
 
-An output value costs (window words + 1) cycles: requantization and write-back
-run in a separate post unit while the next output's multiply-accumulate is
-already under way. Of the CNN's 20,051 cycles, 18,072 are multiply-accumulate.
+An output value costs exactly as many cycles as its window has memory words.
+Everything after address generation is a feed-forward pipeline, so the front
+end issues consecutive outputs back to back. Of the CNN's 11,352 cycles,
+11,312 are multiply-accumulate.
 
-One known inefficiency remains: the single-channel input is padded to 8
-channels, so 7 of the 8 multipliers in the first layer multiply zeros.
+The CNN's input is stored space-to-depth: each 2×2 block of pixels becomes one
+4-channel pixel, so the 28×28 image is a 14×14×4 tensor. That is a pure
+rearrangement. A 2×2 convolution on it is the same arithmetic as a 4×4
+stride-2 convolution on the image, but its window is 4 memory words.
 
 ## Synthesis estimate (SKY130, pre-layout)
 
@@ -44,20 +50,20 @@ Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
 
 | Metric | Value |
 |---|---|
-| Standard cells | 14,211 combinational + 1,314 flip-flops |
-| Logic area | 108,403 µm² (0.108 mm²), 33% of it sequential |
-| Longest combinational path | 3.0 ns → roughly 330 MHz |
-| Time per inference at that clock | CNN ≈ 60 µs, MLP ≈ 19 µs |
+| Standard cells | 18,659 combinational + 1,678 flip-flops |
+| Logic area | 142,011 µm² (0.142 mm²), 32% of it sequential |
+| Longest combinational path | 2.6 ns → roughly 380 MHz |
+| Time per inference at that clock | CNN ≈ 30 µs, MLP ≈ 17 µs |
 | Memory as configured | 659 kbit: weights 524 kbit, 2 × 66 kbit activations, 4 kbit bias |
-| Memory the CNN alone needs | 201 kbit (weights fit in 66 kbit) |
+| Memory the CNN alone needs | 102 kbit: weights 66 kbit, 2 × 16 kbit activations, 4 kbit bias |
 
 These are logic-synthesis estimates, not sign-off numbers: there is no
 placement, routing, clock tree or SRAM macro yet (SRAM access time may well
 set the real clock), and power is not estimated. Memory, not logic, will
 dominate chip area by a wide margin.
 
-The longest path runs from the layer counter through the activation-buffer
-select mux into the multipliers.
+The longest path is one of the 9×17 multipliers in the requantization
+pipeline.
 
 ### History
 
@@ -69,7 +75,8 @@ comparable.
 | 1. Single-cycle requantization, adder chain in the dot product | 5.2 ns | 101,378 µm² | 6,929 | n/a |
 | 2. 3-stage MAC pipeline, multi-cycle requantization | 3.1 ns | 87,594 µm² | 7,389 | n/a |
 | 3. Convolution (window addressing, wider layer table) | 3.0 ns | 102,592 µm² | 7,389 | 47,072 |
-| 4. Current: post unit overlaps the next output | 3.0 ns | 108,403 µm² | 6,460 | 20,051 |
+| 4. Post unit overlaps the next output | 3.0 ns | 108,403 µm² | 6,460 | 20,051 |
+| 5. Current: feed-forward post pipeline, back-to-back outputs | 2.6 ns | 142,011 µm² | 6,377 | 11,352 |
 
 What each step changed in the RTL:
 
@@ -82,13 +89,21 @@ What each step changed in the RTL:
 - **4**: the controller is split into a front end (addresses) and a post unit
   (requantize + write back) that run concurrently; the bias becomes the
   accumulator's initial value instead of a separate add.
+- **5**: the post unit becomes a pipeline that accepts a new sum every cycle
+  (four 9×17 multipliers instead of one reused four times), which removes the
+  minimum spacing between outputs and the set-up cycle before each one; memory
+  outputs are registered before the multipliers. The CNN's drop from 20,051
+  cycles also needs the space-to-depth input, which is a model change: with
+  the old network this hardware takes 18,112.
+
+Step 5 trades area for speed: 31% more logic for a 13% shorter clock period
+and, on the CNN, 43% fewer cycles.
 
 A note on the flow. Yosys and ABC defaults are area-oriented and turn adders
 into ripple-carry chains, which made the very first estimate read 12.2 ns and
 later made results jump between revisions for no RTL reason. `syn/synth.sh`
 maps adders to Kogge-Stone, skips Yosys' built-in generic ABC pass (`-noabc`)
-and uses a delay-oriented ABC script (`syn/abc.script`). Earlier versions of
-this table, produced before `-noabc`, showed smaller areas and slower paths.
+and uses a delay-oriented ABC script (`syn/abc.script`).
 
 ## FPGA (stage 2, in progress)
 
@@ -101,11 +116,11 @@ It builds with the open-source flow (Yosys, nextpnr-himbaechel, gowin_pack):
 
 | Metric | Value |
 |---|---|
-| Timing | 101 MHz achievable, 27 MHz required (board oscillator) |
-| LUT4 | 2,295 of 20,736 (11%) |
-| Flip-flops | 1,027 of 15,552 (6%) |
-| Block RAM | 13 of 46 (28%) |
-| DSP multipliers | 8 × 9×9 and 1 × 18×18 |
+| Timing | 94 MHz achievable, 27 MHz required (board oscillator) |
+| LUT4 | 2,338 of 20,736 (11%) |
+| Flip-flops | 1,340 of 15,552 (8%) |
+| Block RAM | 14 of 46 (30%) |
+| DSP multipliers | 8 × 9×9 and 4 × 18×18 |
 
 What has and has not been checked:
 
@@ -118,9 +133,13 @@ What has and has not been checked:
   example repository; the button's polarity is unverified, so the wrapper
   re-runs on any change of the button.
 
-The numbers are for the CNN-only memory configuration (1,024 weight words).
-The full configuration used for the ASIC estimate synthesizes to 38 block RAMs,
-within the device's 46, but that variant has not been placed and routed.
+The build restricts block RAMs to 18-bit data. In the 36-bit single-port mode
+nextpnr reports hold violations on every such block, for every placement;
+whether those are real or a timing-model artifact is not established.
+
+The numbers are for the CNN-only memory configuration (1,024 weight words,
+256-word activation buffers). The full configuration used for the ASIC
+estimate has not been placed and routed.
 
 ## Architecture
 
@@ -136,17 +155,19 @@ flowchart LR
     end
 
     subgraph mac[MAC pipeline, once per 8 inputs]
+        reg0[Operand registers]
         mul[8 × int8 multipliers<br/>products registered]
         tree[Balanced adder tree]
         acc[32-bit accumulator]
-        mul --> tree --> acc
+        reg0 --> mul --> tree --> acc
     end
 
-    subgraph rq[Post unit, requantization, runs alongside the next output]
-        hmul[× M<br/>9×17 multiplier, 4 cycles]
+    subgraph rq[Post pipeline, once per output]
+        hmul[× M<br/>four 9×17 multipliers]
+        comb[Recombine, 2 stages]
         rnd[Round and shift by S]
         clamp[Clamp to 0..127]
-        hmul --> rnd --> clamp
+        hmul --> comb --> rnd --> clamp
     end
 
     ctrl[Front-end FSM,<br/>window address counters<br/>and layer table]
@@ -154,9 +175,9 @@ flowchart LR
 
     host -- input image --> bufa
     host -- layer descriptors --> ctrl
-    wmem -- 8 weights per cycle --> mul
-    bufa -- 8 activations per cycle --> mul
-    bufb -- 8 activations per cycle --> mul
+    wmem -- 8 weights per cycle --> reg0
+    bufa -- 8 activations per cycle --> reg0
+    bufb -- 8 activations per cycle --> reg0
     bmem -- bias as initial value --> acc
     acc -- hidden layer --> hmul
     clamp -- int8 outputs --> bufb
@@ -186,19 +207,24 @@ Limits: no padding (valid convolutions only), no pooling (use stride),
 convolution output channels must be a multiple of 8, and one requantization
 scale per layer rather than per channel.
 
+### Files
+
 - `rtl/dot_unit.sv` — 8-lane signed 8×8 dot product (the compute core):
   registered multipliers feeding a balanced adder tree.
 - `rtl/nn_accel.sv` — front-end FSM with window addressing, MAC pipeline,
-  post unit (requantization, write-back, argmax). The network is a table of layer descriptors written
-  by the host, so a different network only needs new memory images, not new RTL.
+  post pipeline (requantization, write-back, argmax). The network is a table
+  of layer descriptors written by the host, so a different network only needs
+  new memory images, not new RTL.
 - `rtl/sram_sp.sv` — synchronous-read memory (SRAM macro / block RAM).
-- `model/train.py` — numpy training (CNN or MLP), quantization, memory-image
-  export, and the bit-exact integer reference model.
+- `model/train.py` — numpy training, quantization, memory-image export, and
+  the bit-exact integer reference model.
 - `tb/tb_nn_accel.sv` — self-checking testbench.
+- `fpga/` — Tang Nano 20K demo, build script and gate-level simulation models.
 
 ## Run
 
-Requires `iverilog`, `verilator` (plus `yosys` for synthesis) and Python with `numpy` (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
+Requires `iverilog`, `verilator` (plus `yosys` for synthesis) and Python with
+`numpy` (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
 
 ```bash
 make model      # downloads MNIST, trains, writes build/cnn/*.hex

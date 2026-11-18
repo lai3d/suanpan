@@ -6,7 +6,9 @@ golden outputs from an integer-only reference model.
 
 Architectures
     mlp:  784 -> fc 64 (ReLU) -> fc 10
-    cnn:  28x28x1 -> conv3x3/2 x8 (ReLU) -> conv3x3/2 x16 (ReLU) -> fc 10
+    cnn:  28x28x1 -> conv4x4/2 x8 (ReLU) -> conv3x3/2 x16 (ReLU) -> fc 10
+          The first layer is stored and computed as a 2x2 convolution over a
+          space-to-depth input (14x14x4), which is the same arithmetic.
     stress: hardware corner cases (1x1 conv, odd fc width), not for accuracy
 
 Hardware arithmetic (must match rtl/nn_accel.sv exactly):
@@ -42,8 +44,12 @@ P = 8  # MAC lanes == bytes per memory word
 ARCHS = {
     "mlp": {"input": (1, 1, 784), "layers": [("fc", 64), ("fc", 10)],
             "epochs": 10, "lr": 0.05},
-    "cnn": {"input": (28, 28, 1),
-            "layers": [("conv", 3, 2, 8), ("conv", 3, 2, 16), ("fc", 10)],
+    # "s2d": 2 stores the image space-to-depth: each 2x2 block of pixels
+    # becomes one 4-channel pixel, so "input" is 14x14x4. A 2x2 stride-1
+    # convolution there equals a 4x4 stride-2 convolution on the image, but
+    # its window is 4 memory words instead of 16.
+    "cnn": {"input": (14, 14, 4), "s2d": 2,
+            "layers": [("conv", 2, 1, 8), ("conv", 3, 2, 16), ("fc", 10)],
             "epochs": 12, "lr": 0.05},
     # Not a useful network: a hardware stress test. The 1x1 convolution is a
     # hidden layer with one-word windows, so the front end has to wait for
@@ -72,6 +78,17 @@ def load_mnist():
 
 
 # ------------------------------------------------------------------ geometry
+def prep(arch, x):
+    """Flat 784-pixel images -> the (N, H, W, C) tensor the first layer reads.
+    Space-to-depth is a pure rearrangement: channel order is (dy, dx)."""
+    b = arch.get("s2d")
+    if not b:
+        return x.reshape(-1, *arch["input"])
+    n, side = len(x), 28 // b
+    x = x.reshape(n, side, b, side, b).transpose(0, 1, 3, 2, 4)
+    return x.reshape(n, side, side, b * b)
+
+
 def geometry(arch):
     """Resolve every layer to (k_h, k_w, stride, out_ch) plus in/out shapes."""
     h, w, c = arch["input"]
@@ -115,7 +132,7 @@ def train(arch, geo, xq, y, mom=0.9, bs=64, seed=0):
     """Float training on inputs scaled to [0, 1]. Returns [(W, b)] per layer,
     W shaped (out_ch, kh*kw*c)."""
     rng = np.random.default_rng(seed)
-    x = (xq.astype(np.float32) / 127.0).reshape(-1, *arch["input"])
+    x = prep(arch, xq.astype(np.float32) / 127.0)
     params = []
     for g in geo:
         fan_in = g["kh"] * g["kw"] * g["c"]
@@ -163,7 +180,7 @@ def train(arch, geo, xq, y, mom=0.9, bs=64, seed=0):
 
 
 def float_predict(arch, geo, fparams, xq):
-    a = (xq.astype(np.float32) / 127.0).reshape(-1, *arch["input"])
+    a = prep(arch, xq.astype(np.float32) / 127.0)
     for li, (g, (w, b)) in enumerate(zip(geo, fparams)):
         z = im2col(a, g) @ w.T + b
         a = z if li == len(geo) - 1 else np.maximum(z, 0)
@@ -182,7 +199,7 @@ def int_layer(a, g, q, last):
 def quantize(arch, geo, fparams, calib_xq):
     """Post-training quantization, calibrated layer by layer on integer
     activations so the scales match what the hardware will actually see."""
-    a = calib_xq.reshape(-1, *arch["input"]).astype(np.int64)
+    a = prep(arch, calib_xq).astype(np.int64)
     s_in = 1 / 127.0
     qparams = []
     for li, (g, (w, b)) in enumerate(zip(geo, fparams)):
@@ -206,7 +223,7 @@ def quantize(arch, geo, fparams, calib_xq):
 
 def golden(arch, geo, qparams, xq):
     """Integer-only reference; mirrors the RTL datapath bit for bit."""
-    a = xq.reshape(-1, *arch["input"]).astype(np.int64)
+    a = prep(arch, xq).astype(np.int64)
     for li, (g, q) in enumerate(zip(geo, qparams)):
         a = int_layer(a, g, q, li == len(geo) - 1)
     logits = a.reshape(len(a), -1)
@@ -290,7 +307,7 @@ def main():
     print(f"INT8  accuracy : {(pred == yte).mean() * 100:.2f}%")
 
     weights, biases, cfg = compile_program(geo, qparams)
-    images = pad_c(xte[:n_test].reshape(n_test, *arch["input"])).reshape(n_test, -1)
+    images = pad_c(prep(arch, xte[:n_test])).reshape(n_test, -1)
     in_words = images.shape[1] // P
     write_hex(out / "weights.hex", weights, 16)
     write_hex(out / "bias.hex", biases, 8)
@@ -300,8 +317,8 @@ def main():
     write_hex(out / "labels.hex", yte[:n_test], 2)
     write_hex(out / "golden_class.hex", pred[:n_test], 2)
     write_hex(out / "golden_logits.hex", logits[:n_test].reshape(-1), 8)
-    # one image as raw bytes (channel 0 only) for the FPGA demo ROM
-    write_hex(out / "demo_image.hex", xte[0], 2)
+    # test image 0 as input words, for the FPGA demo ROM
+    write_hex(out / "demo_image.hex", pack_words(images[:1]), 16)
     print(f"demo image     : test image 0, label {yte[0]}, predicted {pred[0]}")
     macs = sum(g["oh"] * g["ow"] * g["oc"] * g["kh"] * g["kw"] * g["c"] for g in geo)
     print(f"weight words   : {len(weights)}  ({len(weights) * 8} bytes)")
