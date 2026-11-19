@@ -62,7 +62,7 @@ def load_data(args):
 
 
 def compile_onnx(args):
-    input_shape, specs, fparams = onnx_io.from_onnx(args.model)
+    input_shape, specs, fparams, links = onnx_io.from_onnx(args.model)
     raw_shape = input_shape
     calib, test, labels = load_data(args)
     if calib.shape[1:] != raw_shape or test.shape[1:] != raw_shape:
@@ -71,24 +71,29 @@ def compile_onnx(args):
     notes = []
 
     # float reference on the model exactly as imported
-    geo0 = nnc.geometry(input_shape, specs)
+    geo0 = nnc.geometry(input_shape, specs, links)
+    private = nnc.input_is_private(geo0)      # may the input layout be changed?
     float_pred = nnc.float_forward(geo0, fparams, test / 127.0).argmax(1)
 
     # rewrites: same function, cheaper layout
     n_ch = [s[3] for s in specs if s[0] == "conv"]
-    specs, fparams = nnc.pad_conv_channels(input_shape, specs, fparams)
+    specs, fparams = nnc.pad_conv_channels(input_shape, specs, fparams, links)
     if [s[3] for s in specs if s[0] == "conv"] != n_ch:
         notes.append("convolution channels rounded up to a multiple of 8 with zero filters")
-    input_shape, flatten = nnc.rewrite_fc_input(input_shape, specs)
+    flatten = False
+    if private:
+        input_shape, flatten = nnc.rewrite_fc_input(input_shape, specs)
     if flatten:
         calib, test = (a.reshape(len(a), 1, 1, -1) for a in (calib, test))
         notes.append("input flattened for the leading fully-connected layer")
-    input_shape, specs, fparams, s2d = nnc.rewrite_s2d(input_shape, specs, fparams)
+    s2d = None
+    if private:
+        input_shape, specs, fparams, s2d = nnc.rewrite_s2d(input_shape, specs, fparams)
     if s2d:
         calib, test = nnc.s2d_input(calib, s2d), nnc.s2d_input(test, s2d)
         notes.append("first convolution rewritten onto a space-to-depth input")
 
-    geo = nnc.geometry(input_shape, specs)
+    geo = nnc.geometry(input_shape, specs, links)
     if not args.no_overlap and nnc.apply_overlap(geo):
         notes.append(f"first convolution reads overlap-packed input, "
                      f"{geo[0]['ovl']} pixels per word")
@@ -104,7 +109,8 @@ def compile_onnx(args):
         elif g["kind"] == "fc":
             print(f"  fc {g['oc']:<19} -> {shape}")
         else:
-            print(f"  conv {g['kh']}x{g['kw']}/{g['s']} pad {g['p']} x{g['oc']:<5} -> {shape}")
+            skip = "" if g["add"] is None else f"  + tensor {g['add']}"
+            print(f"  conv {g['kh']}x{g['kw']}/{g['s']} pad {g['p']} x{g['oc']:<5} -> {shape}{skip}")
     for note in notes:
         print(f"rewrite        : {note}")
     agree = (float_pred == info["pred"]).mean() * 100

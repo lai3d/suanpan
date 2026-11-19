@@ -12,7 +12,8 @@ each one means, costs and proves is in [docs/three-stages.md](docs/three-stages.
 ([中文版](docs/three-stages.zh-CN.md)).
 
 **Stage 1 (done): RTL + simulation.** A from-scratch hardware accelerator
-for INT8 inference with convolution, max pooling and fully-connected layers, verified bit-exactly in
+for INT8 inference with convolution, max pooling, fully-connected layers and
+residual connections, verified bit-exactly in
 simulation against an integer golden model on MNIST.
 
 ## Status
@@ -23,7 +24,7 @@ Two networks run on the same hardware; only the memory images differ.
 |---|---|---|
 | Layers | conv 4×4/2 ×8 → conv 3×3/2 ×16 → fc 10 | fc 64 → fc 10 |
 | Accuracy, float / INT8 | 98.61% / 98.60% | 97.52% / 97.49% |
-| Weights | 7.2 KB | 50.8 KB |
+| Weights | 7.0 KB | 50.8 KB |
 | RTL vs golden model, 10,000 images | 0 mismatches | 0 mismatches |
 | Clock cycles per inference | 8,651 | 6,379 |
 
@@ -71,7 +72,7 @@ make sim-full MEM=build/lenet5
 | Accuracy, float / INT8 | 98.92% / 98.89% |
 | INT8 picks the float model's class | 99.93% of test images |
 | RTL vs golden model, 10,000 images | 0 mismatches |
-| Weights | 63.8 KB |
+| Weights | 62.5 KB |
 | Clock cycles per inference | 79,807 |
 
 `examples/cifar10.onnx` is a small CNN for CIFAR-10, also trained in PyTorch
@@ -84,7 +85,7 @@ padded convolutions.
 | Accuracy, float / INT8 | 81.13% / 80.54% |
 | INT8 picks the float model's class | 96.64% of test images |
 | RTL vs golden model, 10,000 images | 0 mismatches |
-| Weights | 34.4 KB |
+| Weights | 34.0 KB |
 | Clock cycles per inference | 398,166 |
 
 ```bash
@@ -94,25 +95,46 @@ make sim-full MEM=build/cifar10 N_FULL=1000
 
 Quantization costs 0.6 points here, against 0.03 for LeNet-5 on MNIST.
 
+`examples/cifar10_resnet.onnx` adds residual connections
+(`examples/train_cifar10_resnet.py`): three residual blocks at 16, 32 and 64
+channels with a strided convolution between them.
+
+| Residual CIFAR-10 network from PyTorch | |
+|---|---|
+| Layers | 9 convolutions (3 of them with a shortcut added), 1 pooling, 1 fully connected |
+| Accuracy, float / INT8 | 88.06% / 87.72% |
+| INT8 picks the float model's class | 97.50% of test images |
+| RTL vs golden model, 10,000 images | 0 mismatches |
+| Weights | 130.8 KB |
+| Clock cycles per inference | 2,164,644 |
+
+It is 7 points more accurate than the plain CNN above, for 5.4 times the
+cycles and 3.8 times the weights.
+
 What the compiler does:
 
-- **Imports** a chain of Conv, BatchNormalization (folded into the
-  convolution), Relu, MaxPool, Flatten and Gemm / MatMul + Add.
+- **Imports** Conv, BatchNormalization (folded into the convolution), Relu,
+  MaxPool, Flatten, Gemm / MatMul + Add, and Add as a residual connection
+  (folded into the convolution it follows).
 - **Rewrites** the network without changing what it computes: convolution
   channel counts are rounded up to a multiple of 8 with all-zero filters
   (LeNet's 6 becomes 8); a leading fully-connected layer gets a densely packed
   input; an even-sized stride-2 first convolution is moved onto a
   space-to-depth input; a first convolution over few channels reads an
   overlap-packed input.
+- **Allocates** the three activation buffers, keeping a tensor until its last
+  reader has run.
 - **Quantizes** to INT8 after training, using calibration images.
 - **Checks** the result against the hardware's capacity and refuses, with a
   message naming the limit, when the network does not fit.
 - **Writes** the memory images plus the outputs of a bit-exact integer model,
   which is what the RTL is compared against.
 
-Requirements on the model: one input, a single chain of layers, images scaled
-to [0, 1] with no other normalization, ReLU after every hidden convolution or
-fully-connected layer, raw logits at the end. Anything else is rejected with
+Requirements on the model: one input; a chain of layers, optionally with
+residual connections whose shortcut is an identity (a tensor that has already
+been through ReLU); images scaled to [0, 1] with no other normalization; ReLU
+after every hidden convolution or fully-connected layer; raw logits at the
+end. Anything else is rejected with
 an explanation rather than compiled approximately.
 
 The compiler is tested against itself: the networks trained by
@@ -126,12 +148,12 @@ Yosys + ABC onto the open `sky130_fd_sc_hd` library, typical corner (1.8 V,
 
 | Metric | Value |
 |---|---|
-| Standard cells | 19,987 combinational + 1,531 flip-flops |
-| Logic area | 142,457 µm² (0.142 mm²), 27% of it sequential |
+| Standard cells | 22,354 combinational + 1,608 flip-flops |
+| Logic area | 157,263 µm² (0.157 mm²), 26% of it sequential |
 | Longest combinational path | 2.6 ns → roughly 380 MHz |
-| Time per inference at that clock | MNIST CNN ≈ 23 µs, LeNet-5 ≈ 0.21 ms, CIFAR-10 CNN ≈ 1.0 ms |
-| Memory as configured | 802 kbit: weights 524 kbit, 2 × 131 kbit activations, 14 kbit parameters, 1 kbit layer table |
-| Memory the CNN alone needs | 107 kbit: weights 66 kbit, 2 × 16 kbit activations, 7 kbit parameters, 1 kbit layer table |
+| Time per inference at that clock | MNIST CNN ≈ 22 µs, LeNet-5 ≈ 0.21 ms, CIFAR-10 CNN ≈ 1.0 ms, residual network ≈ 5.6 ms |
+| Memory as configured | 1,473 kbit: weights 1,049 kbit, 3 × 131 kbit activations, 28 kbit parameters, 3 kbit layer table |
+| Memory the MNIST CNN alone needs | 109 kbit: weights 66 kbit, 2 × 16 kbit activations, 7 kbit parameters, 3 kbit layer table |
 
 These are logic-synthesis estimates, not sign-off numbers: there is no
 placement, routing, clock tree or SRAM macro yet (SRAM access time may well
@@ -155,7 +177,8 @@ comparable.
 | 5. Feed-forward post pipeline, back-to-back outputs | 2.6 ns | 142,011 µm² | 6,377 | 11,352 |
 | 6. Padding, max pooling, per-channel requantization | 2.6 ns | 141,917 µm² | 6,379 | 11,355 |
 | 7. Larger memories (2,048-word buffers, 256 parameter words) | 2.6 ns | 142,457 µm² | 6,379 | 11,355 |
-| 8. Current: overlap-packed input (compiler only, same hardware) | 2.6 ns | 142,457 µm² | 6,379 | 8,651 |
+| 8. Overlap-packed input (compiler only, same hardware) | 2.6 ns | 142,457 µm² | 6,379 | 8,651 |
+| 9. Current: residual connections (third buffer, shortcut add, 16 layers) | 2.6 ns | 157,263 µm² | 6,379 | 8,651 |
 
 What each step changed in the RTL:
 
@@ -184,6 +207,11 @@ What each step changed in the RTL:
 - **8**: no RTL change. The compiler packs several input pixels into each word
   and uses the pointer steps the hardware already had. LeNet-5 drops from
   205,247 to 79,807 cycles and the CIFAR-10 CNN from 447,318 to 398,166.
+
+- **9**: a third activation buffer, with each layer naming the buffers it
+  reads and writes instead of alternating; a shortcut path in the post
+  pipeline (one more multiplier and a shifter) that adds another layer's
+  output before the clamp; a layer table of 16 entries. Logic grows by 10%.
 
 Step 5 trades area for speed: 31% more logic for a 13% shorter clock period
 and, on the CNN, 43% fewer cycles.
@@ -218,9 +246,12 @@ nextpnr-himbaechel, gowin_pack):
 | | MNIST CNN | LeNet-5 | CIFAR-10 CNN |
 |---|---|---|---|
 | Block RAM (of 46) | 16 | 44 | 42 |
-| LUT4 (of 20,736) | 2,797 | 3,100 | 3,111 |
-| Timing (27 MHz required) | 80 MHz | 84 MHz | 77 MHz |
+| LUT4 (of 20,736) | 3,236 | 3,752 | 3,643 |
+| Timing (27 MHz required) | 79 MHz | 82 MHz | 85 MHz |
 | Routed netlist in gate-level simulation | pass | not run | pass |
+
+The residual network does not fit this board: its weights alone need more
+block RAM than the device has.
 
 Sizing matters: with power-of-two memories the CIFAR-10 network needs about
 48 block RAMs and does not fit. Overlap packing costs some of that back: the
@@ -264,10 +295,9 @@ flowchart LR
     host([Host])
 
     subgraph mem[Memories]
-        wmem[(Weights<br/>8192 × 64 bit)]
-        bmem[(Parameters<br/>256 × 54 bit)]
-        bufa[(Activation<br/>buffer A<br/>2048 × 64 bit)]
-        bufb[(Activation<br/>buffer B<br/>2048 × 64 bit)]
+        wmem[(Weights<br/>16384 × 64 bit)]
+        bmem[(Parameters<br/>512 × 54 bit)]
+        bufa[(Activation<br/>buffers A, B, C<br/>2048 × 64 bit each)]
     end
 
     subgraph mac[MAC pipeline, once per 8 inputs]
@@ -293,12 +323,11 @@ flowchart LR
     host -- layer descriptors --> ctrl
     wmem -- 8 weights per cycle --> reg0
     bufa -- 8 activations per cycle --> reg0
-    bufb -- 8 activations per cycle --> reg0
+    bufa -- shortcut, one byte per output --> rnd
     bmem -- bias as initial value --> acc
     bmem -- M and S per channel --> hmul
-    reg0 -- pooling, lane-wise max --> bufb
+    reg0 -- pooling, lane-wise max --> bufa
     acc -- hidden layer --> hmul
-    clamp -- int8 outputs --> bufb
     clamp -- int8 outputs --> bufa
     acc -- last layer --> out
     ctrl -. addresses and sequencing .-> mem
@@ -306,8 +335,9 @@ flowchart LR
     ctrl -. zero out-of-image words .-> reg0
 ```
 
-The two activation buffers ping-pong: even layers read A and write B, odd
-layers read B and write A.
+There are three activation buffers. Each layer reads one and writes another,
+as the layer table says; a plain chain alternates between A and B, and the
+third is what lets a residual block keep its input while two layers run.
 
 ### How layers are executed
 
@@ -333,7 +363,14 @@ expressed.
   next to the bias. The last layer keeps one scale for all outputs, because
   its raw sums are compared with each other.
 
-Limits: pooling is max only, a network has at most 8 layers, and convolution
+- **Residual connections** are folded into the convolution they follow: as
+  that layer's sums are requantized, the matching byte of the shortcut tensor
+  is read from a third buffer, scaled to the output's scale, and added before
+  the clamp.
+
+Limits: pooling is max only; a network has at most 16 layers and at most
+three feature maps alive at once; shortcuts must be identity shortcuts,
+because activations are stored after ReLU and cannot be negative; convolution
 outputs are written a word at a time, so their channel count is a multiple of
 8 (the compiler pads it).
 
@@ -351,9 +388,10 @@ outputs are written a word at a time, so their channel count is a multiple of
 - `model/onnx_io.py`, `tools/compile.py` — ONNX front end and command line.
 - `model/train.py` — numpy training of the built-in networks.
 - `model/datasets.py` — MNIST and CIFAR-10 loaders.
-- `examples/` — LeNet-5 and a CIFAR-10 CNN trained in PyTorch, with their
-  ONNX files.
-- `tests/test_compiler.py` — compiler tests.
+- `examples/` — LeNet-5, a CIFAR-10 CNN and a residual CIFAR-10 network
+  trained in PyTorch, with their ONNX files.
+- `tests/test_compiler.py` — compiler tests. `tests/make_residual_net.py`
+  builds a small random residual network for RTL regression.
 - `tb/tb_nn_accel.sv` — self-checking testbench.
 - `fpga/` — Tang Nano 20K demo, UART, build script and gate-level simulation
   models.
