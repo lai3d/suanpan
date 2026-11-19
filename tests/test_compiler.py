@@ -54,8 +54,8 @@ def conv_ref(x, w, b, stride=1, pad=0):
 
 
 def run_imported(path, x_nchw):
-    shape, specs, fparams = onnx_io.from_onnx(path)
-    geo = nnc.geometry(shape, specs)
+    shape, specs, fparams, links = onnx_io.from_onnx(path)
+    geo = nnc.geometry(shape, specs, links)
     return nnc.float_forward(geo, fparams, x_nchw.transpose(0, 2, 3, 1))
 
 
@@ -205,6 +205,92 @@ def test_overlap_packing_is_exact():
         assert not nnc.apply_overlap(nnc.geometry(shape, [spec, ("fc", 3)]))
 
 
+def residual_graph(swap=False, shortcut_relu=True):
+    """conv1 -> relu -> conv2 -> relu -> conv3 -> BN -> (+ relu1) -> relu -> fc"""
+    r = {k: rand(8, 8, 3, 3) for k in ("w1", "w2", "w3")}
+    r.update({k: rand(8) for k in ("b1", "b2", "b3", "be", "mu")})
+    r["g"], r["va"] = rand(8) + 1.5, np.abs(rand(8)) + 0.5
+    r["fw"], r["fb"] = rand(4, 8 * 6 * 6), rand(4)
+    conv = lambda i, src, dst: helper.make_node(
+        "Conv", [src, f"w{i}", f"b{i}"], [dst], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    short = "r1" if shortcut_relu else "c1"
+    nodes = [conv(1, "input", "c1"), helper.make_node("Relu", ["c1"], ["r1"]),
+             conv(2, "r1", "c2"), helper.make_node("Relu", ["c2"], ["r2"]),
+             conv(3, "r2", "c3"),
+             helper.make_node("BatchNormalization", ["c3", "g", "be", "mu", "va"], ["bn"]),
+             helper.make_node("Add", [short, "bn"] if swap else ["bn", short], ["s"]),
+             helper.make_node("Relu", ["s"], ["r3"]),
+             helper.make_node("Flatten", ["r3"], ["f"], axis=1),
+             helper.make_node("Gemm", ["f", "fw", "fb"], ["y"], transB=1)]
+    return nodes, r
+
+
+def test_residual_import_matches_reference():
+    """A residual block, with the Add operands in either order, against an
+    independent numpy implementation."""
+    for swap in (False, True):
+        nodes, r = residual_graph(swap)
+        path = save(nodes, r, (8, 6, 6))
+        shape, specs, fparams, links = onnx_io.from_onnx(path)
+        assert links == [(0, None), (1, None), (2, 1), (3, None)], links
+        x = rng.random((3, 8, 6, 6)).astype(np.float32)
+        r1 = np.maximum(conv_ref(x, r["w1"], r["b1"], 1, 1), 0)
+        r2 = np.maximum(conv_ref(r1, r["w2"], r["b2"], 1, 1), 0)
+        c3 = conv_ref(r2, r["w3"], r["b3"], 1, 1)
+        bn = (c3 - r["mu"][None, :, None, None]) / np.sqrt(r["va"] + 1e-5)[None, :, None, None]
+        bn = bn * r["g"][None, :, None, None] + r["be"][None, :, None, None]
+        ref = np.maximum(bn + r1, 0).reshape(3, -1) @ r["fw"].T + r["fb"]
+        assert np.allclose(run_imported(path, x), ref, atol=1e-3)
+
+
+def test_residual_quantized_and_buffers():
+    nodes, r = residual_graph()
+    shape, specs, fparams, links = onnx_io.from_onnx(save(nodes, r, (8, 6, 6)))
+    geo = nnc.geometry(shape, specs, links)
+    # tensor 1 (the shortcut) must survive layers 1 and 2: three buffers in use
+    assert nnc.allocate_buffers(geo) == [0, 1, 0, 2, None]
+    a = rng.integers(0, 128, (300, 6, 6, 8))
+    q = nnc.quantize(geo, fparams, a)
+    assert q[2]["K"] > 0 and (q[2]["S"] >= nnc.SKIP_SHIFT).all()
+    weights, params, cfg = nnc.compile_program(geo, q)
+    fields = {}
+    pos = 0
+    for name, width in nnc.CFG_FIELDS:
+        fields[name] = [(c >> pos) & ((1 << width) - 1) for c in cfg]
+        pos += width
+    assert fields["src_buf"] == [0, 1, 0, 2] and fields["skip_en"] == [0, 0, 1, 0]
+    assert fields["dst_buf"][:3] == [1, 0, 2] and fields["skip_buf"][2] == 1
+    assert fields["skip_mult"][2] == q[2]["K"]
+    logits = nnc.float_forward(geo, fparams, a / 127.0)
+    top = np.sort(logits, 1)
+    clear = (top[:, -1] - top[:, -2]) > 0.25 * logits.std()
+    _, pred = nnc.golden(geo, q, a)
+    assert (pred == logits.argmax(1))[clear].mean() > 0.97
+
+    # a plain chain still alternates between two buffers
+    chain = nnc.geometry((6, 6, 8), [("conv", 3, 1, 8, 1)] * 4 + [("fc", 3)])
+    assert nnc.allocate_buffers(chain) == [0, 1, 0, 1, 0, None]
+
+
+def test_residual_errors():
+    # a shortcut that has not been through ReLU could be negative
+    nodes, r = residual_graph(shortcut_relu=False)
+    expect_error("identity shortcut", lambda: onnx_io.from_onnx(save(nodes, r, (8, 6, 6))))
+    # four feature maps alive at once: two nested shortcuts
+    specs = [("conv", 3, 1, 8, 1)] * 5 + [("fc", 3)]
+    links = [(0, None), (1, None), (2, None), (3, 2), (4, 1), (5, None)]
+    geo = nnc.geometry((6, 6, 8), specs, links)
+    expect_error("feature maps", lambda: nnc.allocate_buffers(geo))
+    # shortcut of the wrong shape
+    expect_error("shape", lambda: nnc.geometry(
+        (6, 6, 8), [("conv", 3, 1, 8, 1), ("conv", 3, 2, 8, 1), ("fc", 3)],
+        [(0, None), (1, 1), (2, None)]))
+    # the input layout may not be changed if a shortcut also reads the input
+    geo = nnc.geometry((6, 6, 8), [("conv", 3, 1, 8, 1), ("conv", 3, 1, 8, 1), ("fc", 3)],
+                       [(0, None), (1, 0), (2, None)])
+    assert not nnc.input_is_private(geo)
+
+
 def test_s2d_not_applied_when_unsafe():
     for specs in ([("conv", 3, 2, 8), ("fc", 3)],          # odd kernel
                   [("conv", 4, 1, 8), ("fc", 3)],          # stride 1
@@ -246,7 +332,7 @@ def test_errors_are_explained():
     avg = helper.make_node("AveragePool", ["r"], ["p"], kernel_shape=[2, 2])
     expect_error("unsupported operator AveragePool",
                  lambda: onnx_io.from_onnx(save([conv, relu, avg, flat("p"), gemm], inits, (1, 8, 8))))
-    expect_error("not followed by ReLU",
+    expect_error("without a ReLU",
                  lambda: onnx_io.from_onnx(save([conv, flat("c"), gemm], inits, (1, 8, 8))))
     dil = helper.make_node("Conv", ["input", "w", "b"], ["c"], kernel_shape=[3, 3], dilations=[2, 2])
     expect_error("dilation", lambda: onnx_io.from_onnx(save([dil, relu, flat("r"), gemm], inits, (1, 8, 8))))
@@ -259,7 +345,7 @@ def test_errors_are_explained():
     req = dict(layers=2, weight_words=10, param_words=18, act_words=64 * 64, in_words=4096, n_out=10)
     expect_error("A_AW=12", lambda: nnc.check_limits(req))
     assert big[0]["oh"] == 64
-    expect_error("9 layers", lambda: nnc.check_limits(dict(req, act_words=10, layers=9)))
+    expect_error("17 layers", lambda: nnc.check_limits(dict(req, act_words=10, layers=17)))
 
 
 def test_roundtrip_is_byte_identical():

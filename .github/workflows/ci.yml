@@ -77,6 +77,16 @@ jobs:
           make cifar10-ci PY=python
           make sim-full PY=python MEM=build/cifar10-ci N_FULL=32
 
+      - name: Residual connections, random network, 200 inputs (Verilator)
+        run: |
+          make restest PY=python
+          make sim-full PY=python MEM=build/restest N_FULL=200
+
+      - name: PyTorch residual CIFAR-10 network from ONNX, 4 images (Verilator)
+        run: |
+          make resnet-ci PY=python
+          make sim-full PY=python MEM=build/resnet-ci N_FULL=4
+
       - name: Synthesize (SKY130)
         run: make synth
 

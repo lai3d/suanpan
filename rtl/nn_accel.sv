@@ -6,7 +6,9 @@
 //     hidden layer: y = clamp((acc * M + 2^(S-1)) >>> S, 0, 127)  -> next buffer
 //     last layer  : raw acc streamed out as a logit, argmax tracked
 //     pooling     : y = lane-wise maximum over the window, written as a word
-// bias, M and S come from one parameter word per output channel.
+//     shortcut    : a hidden layer can add another layer's output x before the
+//                   clamp:  y = clamp((acc * M + ((x * K) << (S-14)) + 2^(S-1)) >>> S, 0, 127)
+// bias, M and S come from one parameter word per output channel; K is per layer.
 //
 // Timing: everything after address generation is a feed-forward pipeline.
 // The MAC loop has four stages (register operands, multiply, adder tree,
@@ -34,7 +36,7 @@
 //
 // The network is a small table of layer descriptors (the "program") in a
 // memory the host writes through the cfg_* port while the core is idle.
-// Each 176-bit entry is, LSB first (keep in sync with model/train.py):
+// Each 208-bit entry is, LSB first (keep in sync with model/nnc.py):
 //     [3:0]     kw         kernel width in pixels
 //     [7:4]     kh         kernel rows
 //     [19:8]    rd_words   words read per window pixel
@@ -54,26 +56,34 @@
 //     [171:160] b_base     first parameter word of the layer
 //     [172]     pool       max pooling instead of multiply-accumulate
 //     [173]     last       final layer: emit logits instead of requantising
+//     [175:174] src_buf    activation buffer the layer reads
+//     [177:176] dst_buf    activation buffer the layer writes
+//     [179:178] skip_buf   activation buffer holding the shortcut tensor
+//     [180]     skip_en    add the shortcut (residual connection)
+//     [196:181] skip_mult  K, the shortcut's scale as a fraction of 2^14
 //
 // Parameter word, one per output channel: [31:0] bias, [47:32] M, [53:48] S.
 //
 // Weights for one output pixel are out_ch consecutive kernels, and the same
-// kernels are reused for every pixel. Activations ping-pong between two
-// buffers: layer 0 reads A / writes B, layer 1 reads B / writes A, and so on.
-// The host loads the input into A.
+// kernels are reused for every pixel. There are three activation buffers; each
+// layer names the one it reads and the one it writes, and a shortcut is read
+// from a third. A plain chain alternates between buffers 0 and 1; the third is
+// what lets a residual block keep its input while two layers run. The host
+// loads the input into buffer 0.
 module nn_accel #(
     parameter int P          = 8,    // MAC lanes (bytes per memory word)
-    parameter int W_AW       = 13,   // weight memory address bits (words)
+    parameter int W_AW       = 14,   // weight memory address bits (words)
     parameter int A_AW       = 11,   // activation buffer address bits (words)
-    parameter int B_AW       = 8,    // parameter memory address bits
-    parameter int MAX_LAYERS = 8,
+    parameter int B_AW       = 9,    // parameter memory address bits
+    parameter int MAX_LAYERS = 16,
     // Memory depths in words; 0 means the full 2^AW. A design built for one
     // network can use the exact sizes the compiler reports (net_params.vh).
-    // Buffer A holds the input and the outputs of odd layers, buffer B the
-    // outputs of even layers, so the two rarely need the same depth.
+    // The compiler decides which tensors live in which activation buffer, so
+    // the three rarely need the same depth.
     parameter int W_DEPTH    = 0,
     parameter int BUFA_DEPTH = 0,
     parameter int BUFB_DEPTH = 0,
+    parameter int BUFC_DEPTH = 0,
     parameter int B_DEPTH    = 0,
     // optional $readmemh images for the weight and parameter memories (ROM use)
     parameter     W_FILE     = "",
@@ -85,7 +95,7 @@ module nn_accel #(
     // host: program the layer table (only while idle)
     input  logic                cfg_we,
     input  logic [$clog2(MAX_LAYERS)-1:0] cfg_addr,
-    input  logic [175:0]        cfg_data,
+    input  logic [207:0]        cfg_data,
 
     // host: load input activations into buffer A (only while idle)
     input  logic                in_we,
@@ -94,7 +104,7 @@ module nn_accel #(
 
     // control
     input  logic                start,
-    input  logic [3:0]          num_layers,
+    input  logic [4:0]          num_layers,
     output logic                busy,
     output logic                done,       // 1-cycle pulse
     output logic [7:0]          class_idx,  // argmax of the final layer
@@ -107,8 +117,10 @@ module nn_accel #(
     localparam int LP = $clog2(P);
     localparam int LW = $clog2(MAX_LAYERS);
     localparam int W_WORDS = (W_DEPTH != 0) ? W_DEPTH    : (1 << W_AW);
-    localparam int A_WORDS = (BUFA_DEPTH != 0) ? BUFA_DEPTH : (1 << A_AW);
-    localparam int C_WORDS = (BUFB_DEPTH != 0) ? BUFB_DEPTH : (1 << A_AW);
+    localparam int SKIP_SHIFT = 14;
+    localparam int BUF0_WORDS = (BUFA_DEPTH != 0) ? BUFA_DEPTH : (1 << A_AW);
+    localparam int BUF1_WORDS = (BUFB_DEPTH != 0) ? BUFB_DEPTH : (1 << A_AW);
+    localparam int BUF2_WORDS = (BUFC_DEPTH != 0) ? BUFC_DEPTH : (1 << A_AW);
     localparam int B_WORDS = (B_DEPTH != 0) ? B_DEPTH    : (1 << B_AW);
 
     // front end: walks layers, output pixels and kernel windows
@@ -118,10 +130,10 @@ module nn_accel #(
     state_t state;
 
     // ---------------------------------------------------------------- config
-    logic [3:0]   layer;
-    logic [175:0] cfg;
+    logic [4:0]   layer;
+    logic [207:0] cfg;
 
-    sram_sp #(.DW(176), .AW(LW)) u_cfg (
+    sram_sp #(.DW(208), .AW(LW)) u_cfg (
         .clk, .we(cfg_we), .addr(cfg_we ? cfg_addr : layer[LW-1:0]),
         .wdata(cfg_data), .rdata(cfg));
 
@@ -131,7 +143,9 @@ module nn_accel #(
     logic [15:0] c_step_y, c_org;
     logic [7:0]  c_in_w, c_in_h, c_ow_last, c_oh_last;
     logic [19:0] c_w_base;
-    logic        c_pool, c_last;
+    logic        c_pool, c_last, c_sken;
+    logic [1:0]  c_src, c_dst, c_skb;   // buffers: read, write, shortcut
+    logic [15:0] c_skm;                 // shortcut multiplier K
 
     // -------------------------------------------------------------- counters
     logic [11:0]     och;        // output channel (or output word, if pooling)
@@ -145,8 +159,6 @@ module nn_accel #(
     logic [A_AW-1:0] row_base;   // window origin for the current output row
     logic [W_AW-1:0] w_ptr;      // running weight address
     logic [B_AW-1:0] b_ptr;      // running parameter address
-    logic            src_sel;    // 0: read A / write B,  1: read B / write A
-    assign src_sel = layer[0];
 
     logic pix_end, row_end, mac_first, mac_last, ch_end, col_end, layer_end, oob;
     assign pix_end   = (kcw == c_rd_last);
@@ -186,7 +198,9 @@ module nn_accel #(
     assign a_start = pix_next + (c_pool ? och_next[A_AW-1:0] : '0);
 
     // -------------------------------------------------------------- memories
-    logic [P*8-1:0] w_q, a_q, bufa_q, bufb_q;
+    logic [P*8-1:0] w_q, a_q, sk_q;
+    logic [P*8-1:0] buf_q [0:2];
+    logic [A_AW-1:0] sk_addr;    // shortcut read address
     logic [53:0]    b_q;         // {S[5:0], M[15:0], bias[31:0]}
     logic           dst_we;
     logic [A_AW-1:0] dst_addr;
@@ -198,20 +212,33 @@ module nn_accel #(
     sram_sp #(.DW(54), .AW(B_AW), .DEPTH(B_WORDS), .FILE(B_FILE)) u_bmem (
         .clk, .we(1'b0), .addr(b_ptr), .wdata('0), .rdata(b_q));
 
-    logic            bufa_we, bufb_we;
-    logic [A_AW-1:0] bufa_addr, bufb_addr;
-    assign bufa_we   = in_we | (dst_we & src_sel);
-    assign bufb_we   = dst_we & ~src_sel;
-    assign bufa_addr = in_we ? in_addr : (dst_we & src_sel) ? dst_addr : a_ptr;
-    assign bufb_addr = bufb_we ? dst_addr : a_ptr;
+    // Three single-port buffers. In any one layer a buffer has at most one
+    // role: source of the window walk, destination of the outputs, or shortcut.
+    // The host writes the input into buffer 0 while the core is idle.
+    logic            buf_we   [0:2];
+    logic [A_AW-1:0] buf_addr [0:2];
+    always_comb begin
+        for (int k = 0; k < 3; k++) begin
+            buf_we[k]   = dst_we && (c_dst == 2'(k));
+            buf_addr[k] = buf_we[k]                        ? dst_addr :
+                          (c_sken && c_skb == 2'(k))       ? sk_addr  : a_ptr;
+        end
+        if (in_we) begin
+            buf_we[0]   = 1'b1;
+            buf_addr[0] = in_addr;
+        end
+    end
 
-    sram_sp #(.DW(P*8), .AW(A_AW), .DEPTH(A_WORDS)) u_bufa (
-        .clk, .we(bufa_we), .addr(bufa_addr),
-        .wdata(in_we ? in_data : dst_data), .rdata(bufa_q));
-    sram_sp #(.DW(P*8), .AW(A_AW), .DEPTH(C_WORDS)) u_bufb (
-        .clk, .we(bufb_we), .addr(bufb_addr), .wdata(dst_data), .rdata(bufb_q));
+    sram_sp #(.DW(P*8), .AW(A_AW), .DEPTH(BUF0_WORDS)) u_bufa (
+        .clk, .we(buf_we[0]), .addr(buf_addr[0]),
+        .wdata(in_we ? in_data : dst_data), .rdata(buf_q[0]));
+    sram_sp #(.DW(P*8), .AW(A_AW), .DEPTH(BUF1_WORDS)) u_bufb (
+        .clk, .we(buf_we[1]), .addr(buf_addr[1]), .wdata(dst_data), .rdata(buf_q[1]));
+    sram_sp #(.DW(P*8), .AW(A_AW), .DEPTH(BUF2_WORDS)) u_bufc (
+        .clk, .we(buf_we[2]), .addr(buf_addr[2]), .wdata(dst_data), .rdata(buf_q[2]));
 
-    assign a_q = src_sel ? bufb_q : bufa_q;
+    assign a_q  = buf_q[c_src];
+    assign sk_q = buf_q[c_skb];
 
     // ------------------------------------------------------------- MAC pipe
     //   cycle n   : address issued (state == S_MAC)
@@ -263,6 +290,14 @@ module nn_accel #(
     //   p5 : >>> S
     //   p6 : clamp to 0..127, then assembled into a word and written
     // M and S belong to the output, so they travel with it.
+    //
+    // Shortcut. Outputs are numbered as they are handed off (h_cnt); the
+    // shortcut tensor has the output's shape, so its byte for output i is byte
+    // i of the shortcut buffer. The word is read during the hand-off cycle and
+    // the byte follows the output down the pipeline:
+    //   p1 : shortcut byte x        p2 : x * K
+    //   p3 : (x*K + 2^13) << (S-14), which is the shortcut term and the
+    //        rounding constant in one, since 2^13 << (S-14) = 2^(S-1)
     localparam int PN = 7;                   // post pipeline stages
     logic [PN-1:0]      pv;                  // stage valid
     logic [PN-1:0]      pe;                  // end-of-layer tag
@@ -274,6 +309,13 @@ module nn_accel #(
     logic signed [47:0] p3_prod, p3_rc, p4_rnd, p5_shf;
     logic [7:0]         q;
     logic [15:0]        o_cnt;               // outputs (bytes, or words if pooling) written
+    logic [15:0]        h_cnt;               // outputs handed off in this layer
+    logic [LP-1:0]      p0_lane;             // lane of the shortcut byte
+    logic [7:0]         p1_skip;
+    logic [23:0]        p2_sk;               // x * K
+    logic [P*8-1:0]     sk_lanes;
+    assign sk_addr  = h_cnt[LP +: A_AW];
+    assign sk_lanes = sk_q >> {p0_lane, 3'b000};
 
     // output word assembly: collect P bytes, then one full-word write
     logic [P*8-1:0] out_word, out_word_n;
@@ -359,6 +401,15 @@ module nn_accel #(
             p0_acc      <= '0;
             p0_m        <= '0;
             p0_s        <= '0;
+            h_cnt       <= '0;
+            p0_lane     <= '0;
+            p1_skip     <= '0;
+            p2_sk       <= '0;
+            c_sken      <= 1'b0;
+            c_src       <= '0;
+            c_dst       <= '0;
+            c_skb       <= '0;
+            c_skm       <= '0;
             p1_s        <= '0;
             p2_s        <= '0;
             p3_s        <= '0;
@@ -418,8 +469,10 @@ module nn_accel #(
             pe <= {pe[PN-2:0], e3};
             if (handoff) begin
                 p0_acc <= acc_y;
-                p0_m   <= par_r2[47:32];
-                p0_s   <= par_r2[53:48];
+                p0_m    <= par_r2[47:32];
+                p0_s    <= par_r2[53:48];
+                p0_lane <= h_cnt[LP-1:0];
+                h_cnt   <= h_cnt + 16'd1;
             end
             if (pv[0]) begin
                 p1_pp[3] <= $signed({p0_acc[31], p0_acc[31:24]}) * $signed({1'b0, p0_m});
@@ -427,15 +480,18 @@ module nn_accel #(
                 p1_pp[1] <= $signed({1'b0, p0_acc[15:8]})  * $signed({1'b0, p0_m});
                 p1_pp[0] <= $signed({1'b0, p0_acc[7:0]})   * $signed({1'b0, p0_m});
                 p1_s     <= p0_s;
+                p1_skip  <= sk_lanes[7:0];        // the word read at hand-off
             end
             if (pv[1]) begin
                 p2_hi <= (35'(p1_pp[3]) <<< 8) + 35'(p1_pp[2]);
                 p2_lo <= (35'(p1_pp[1]) <<< 8) + 35'(p1_pp[0]);
                 p2_s  <= p1_s;
+                p2_sk <= p1_skip * c_skm;
             end
             if (pv[2]) begin
                 p3_prod <= (48'(p2_hi) <<< 16) + 48'(p2_lo);
-                p3_rc   <= 48'sd1 <<< (p2_s - 6'd1);
+                p3_rc   <= c_sken ? (48'(p2_sk) + 48'd8192) << (p2_s - 6'(SKIP_SHIFT))
+                                  : 48'sd1 <<< (p2_s - 6'd1);
                 p3_s    <= p2_s;
             end
             if (pv[3]) begin
@@ -493,6 +549,11 @@ module nn_accel #(
                     c_b_base   <= cfg[171:160];
                     c_pool     <= cfg[172];
                     c_last     <= cfg[173];
+                    c_src      <= cfg[175:174];
+                    c_dst      <= cfg[177:176];
+                    c_skb      <= cfg[179:178];
+                    c_sken     <= cfg[180];
+                    c_skm      <= cfg[196:181];
                     state      <= S_LAYER;
                 end
 
@@ -513,6 +574,7 @@ module nn_accel #(
                     pix_base <= c_org[A_AW-1:0];
                     row_base <= c_org[A_AW-1:0];
                     o_cnt    <= '0;
+                    h_cnt    <= '0;
                     out_word <= '0;
                     state    <= S_MAC;
                 end
@@ -573,10 +635,10 @@ module nn_accel #(
                 S_DRAIN: if (!v0 && !v1 && !v2 && !v3 && !pw_v && pv == '0) state <= S_NEXT;
 
                 S_NEXT: begin
-                    if (c_last || layer == num_layers - 4'd1) begin
+                    if (c_last || layer == num_layers - 5'd1) begin
                         state <= S_DONE;
                     end else begin
-                        layer <= layer + 4'd1;
+                        layer <= layer + 5'd1;
                         state <= S_FETCH;
                     end
                 end

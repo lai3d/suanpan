@@ -13,7 +13,7 @@ N_FULL ?= 10000
 # override VOBJ if this checkout lives under one.
 VOBJ ?= build/obj
 
-.PHONY: model sim sim-full wave lint synth test-compiler lenet5 cifar10 cifar10-ci fpga fpga-sim fpga-gatesim fpga-load fpga-flash clean
+.PHONY: model sim sim-full wave lint synth test-compiler restest lenet5 cifar10 cifar10-ci resnet resnet-ci fpga fpga-sim fpga-gatesim fpga-load fpga-flash clean
 
 # Train + quantize the network, export memory images and golden vectors.
 model $(MEM)/weights.hex:
@@ -30,8 +30,8 @@ sim-full: $(MEM)/weights.hex
 	verilator --binary --timing -Wno-fatal -O3 --Mdir $(VOBJ) \
 	    --top-module tb_nn_accel -o tb $(RTL) $(TB) > build/verilator.log 2>&1 \
 	    || (cat build/verilator.log; exit 1)
-	$(VOBJ)/tb +MEM=$(MEM) +N=$(N_FULL) | tee build/sim-full.log
-	@grep -q "RESULT: PASS" build/sim-full.log
+	$(VOBJ)/tb +MEM=$(MEM) +N=$(N_FULL) | tee $(VOBJ)/sim-full.log
+	@grep -q "RESULT: PASS" $(VOBJ)/sim-full.log
 
 # Dump a waveform for one image -> build/tb.vcd
 wave: $(MEM)/weights.hex
@@ -52,6 +52,15 @@ synth:
 test-compiler:
 	$(PY) tests/test_compiler.py
 
+# A small random residual network -> build/restest. RTL regression for the
+# shortcut path and the third buffer: `make restest && make sim MEM=build/restest N=200`
+restest:
+	$(PY) tests/make_residual_net.py
+
+# Compile the PyTorch residual CIFAR-10 network in examples/ -> build/resnet
+resnet:
+	$(PY) tools/compile.py examples/cifar10_resnet.onnx --out build/resnet --data cifar10
+
 # Compile the PyTorch LeNet-5 in examples/ -> build/lenet5
 lenet5:
 	$(PY) tools/compile.py examples/lenet5.onnx --out build/lenet5 --data mnist
@@ -64,6 +73,10 @@ cifar10:
 # The same network from the small image subsets committed in examples/, so it
 # can be compiled and simulated without the dataset. Quantization is
 # calibrated on 128 images here, so accuracy differs from `make cifar10`.
+resnet-ci:
+	$(PY) tools/compile.py examples/cifar10_resnet.onnx --out build/resnet-ci \
+	    --calib examples/cifar10_calib.npz --test examples/cifar10_test.npz
+
 cifar10-ci:
 	$(PY) tools/compile.py examples/cifar10.onnx --out build/cifar10-ci \
 	    --calib examples/cifar10_calib.npz --test examples/cifar10_test.npz
